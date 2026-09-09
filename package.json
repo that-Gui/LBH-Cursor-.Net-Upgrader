@@ -1,0 +1,29 @@
+{
+  "name": "lbh-cursor-dotnet-upgrader",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.18.0"
+  },
+  "scripts": {
+    "inventory": "tsx --env-file-if-exists=.env src/main.ts inventory",
+    "select": "tsx --env-file-if-exists=.env src/main.ts select",
+    "prepare-repo": "tsx --env-file-if-exists=.env src/main.ts prepare",
+    "complete-run": "tsx --env-file-if-exists=.env src/main.ts complete",
+    "finalize": "tsx --env-file-if-exists=.env src/main.ts finalize",
+    "test": "tsx --test test/**/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test"
+  },
+  "dependencies": {
+    "@octokit/plugin-retry": "^7.2.1",
+    "@octokit/plugin-throttling": "^9.6.1",
+    "@octokit/rest": "^21.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.3.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
