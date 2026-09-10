@@ -159,3 +159,103 @@ describe("parseUpgradeResult / summaryText", () => {
     assert.ok(text.endsWith("BASELINE_FAILURES: 2\nREVIEWERS: PASS\nUPGRADE_RESULT: SUCCESS"));
   });
 });
+
+describe("summaryText marker trailer", () => {
+  const conforming = [
+    "Moved all TFMs to net10.0 and bumped EF Core.",
+    "BASELINE_FAILURES: 3",
+    "REVIEWERS: PASS",
+    "UPGRADE_RESULT: SUCCESS",
+  ].join("\n");
+
+  it("does not repeat a trailer the writer already wrote", () => {
+    const text = summaryText(sampleResult({ implementationSummary: conforming, baselineFailures: 3 }));
+    assert.equal(text, conforming);
+    for (const marker of ["BASELINE_FAILURES:", "REVIEWERS:", "UPGRADE_RESULT:"]) {
+      assert.equal(text.split(marker).length - 1, 1, `${marker} must appear exactly once`);
+    }
+    assert.deepEqual(parseMarkers(text), { ok: true, baselineFailures: 3 });
+  });
+
+  it("replaces a writer trailer that disagrees with the parent's values", () => {
+    const stale = [
+      "Bumped EF Core.",
+      "BASELINE_FAILURES: 0",
+      "REVIEWERS: FAIL",
+      "UPGRADE_RESULT: FAILED",
+    ].join("\n");
+    const text = summaryText(sampleResult({ implementationSummary: stale, baselineFailures: 3 }));
+    assert.equal(text, "Bumped EF Core.\nBASELINE_FAILURES: 3\nREVIEWERS: PASS\nUPGRADE_RESULT: SUCCESS");
+    assert.ok(!text.includes("REVIEWERS: FAIL"), "the stale verdict must not survive");
+    assert.ok(!text.includes("UPGRADE_RESULT: FAILED"));
+    assert.ok(!text.includes("BASELINE_FAILURES: 0"));
+    assert.deepEqual(parseMarkers(text), { ok: true, baselineFailures: 3 });
+  });
+
+  it("ignores blank and whitespace-only lines around the trailer", () => {
+    const padded = `Bumped EF Core.\n\nBASELINE_FAILURES: 3\n  \nREVIEWERS: PASS\n\nUPGRADE_RESULT: SUCCESS\n\n  \n`;
+    const text = summaryText(sampleResult({ implementationSummary: padded, baselineFailures: 3 }));
+    assert.equal(text, "Bumped EF Core.\nBASELINE_FAILURES: 3\nREVIEWERS: PASS\nUPGRADE_RESULT: SUCCESS");
+  });
+
+  it("keeps a summary that is nothing but a trailer down to one copy", () => {
+    const text = summaryText(sampleResult({ implementationSummary: conforming.split("\n").slice(1).join("\n"), baselineFailures: 3 }));
+    assert.equal(text, "BASELINE_FAILURES: 3\nREVIEWERS: PASS\nUPGRADE_RESULT: SUCCESS");
+  });
+
+  it("leaves prose alone when the last lines are not a marker trailer", () => {
+    for (const summary of [
+      "REVIEWERS: PASS was reported mid-run, then we bumped EF Core.",
+      "UPGRADE_RESULT: SUCCESS is what the writer claimed but it kept working",
+      "BASELINE_FAILURES: 3\nREVIEWERS: PASS\nthen one more fix landed",
+    ]) {
+      const text = summaryText(sampleResult({ implementationSummary: summary, baselineFailures: 3 }));
+      assert.ok(
+        text.startsWith(summary),
+        `body must be preserved verbatim, got ${JSON.stringify(text)}`,
+      );
+      assert.ok(text.endsWith("BASELINE_FAILURES: 3\nREVIEWERS: PASS\nUPGRADE_RESULT: SUCCESS"));
+    }
+  });
+});
+
+describe("packageDecisions", () => {
+  const decision = {
+    package: "Microsoft.EntityFrameworkCore",
+    from: "8.0.4",
+    to: "10.0.0",
+    reason: "8.0.4 has no net10.0-compatible assets",
+    evidence: "first stable release with a net10.0 target",
+  };
+
+  it("round-trips a full entry", () => {
+    const parsed = parseUpgradeResult(sampleResult({ packageDecisions: [decision] }));
+    assert.deepEqual(parsed.packageDecisions, [decision]);
+  });
+
+  it("keeps optional from/to/evidence absent rather than undefined", () => {
+    const parsed = parseUpgradeResult(
+      sampleResult({ packageDecisions: [{ package: "Serilog", reason: "pinned by the new SDK" }] }),
+    );
+    assert.deepEqual(parsed.packageDecisions, [{ package: "Serilog", reason: "pinned by the new SDK" }]);
+  });
+
+  it("defaults to [] when the field is absent, so schemaVersion 1 results still validate", () => {
+    const { packageDecisions, ...withoutField } = sampleResult();
+    assert.equal(packageDecisions?.length, 0);
+    assert.deepEqual(parseUpgradeResult(withoutField).packageDecisions, []);
+    assert.equal(isFinalizable(parseUpgradeResult(withoutField)), true);
+  });
+
+  it("rejects malformed entries", () => {
+    const withDecisions = (packageDecisions: unknown) => () =>
+      parseUpgradeResult({ ...sampleResult(), packageDecisions });
+    assert.throws(withDecisions("Newtonsoft.Json"), /packageDecisions must be an array/);
+    assert.throws(withDecisions(["Newtonsoft.Json"]), /packageDecisions\[0\] must be an object/);
+    assert.throws(withDecisions([{ reason: "no package id" }]), /package must be a string/);
+    assert.throws(withDecisions([{ package: " ", reason: "blank id" }]), /package must not be empty/);
+    assert.throws(withDecisions([{ package: "Serilog" }]), /reason must be a string/);
+    assert.throws(withDecisions([{ package: "Serilog", reason: "" }]), /reason must not be empty/);
+    assert.throws(withDecisions([{ package: "Serilog", reason: "ok", from: 8 }]), /from must be a string/);
+  });
+});

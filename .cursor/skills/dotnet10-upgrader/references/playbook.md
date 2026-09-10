@@ -6,6 +6,7 @@ Upgrade this repository to .NET 10 (LTS).
 - FIRST, before you edit anything: run 'dotnet build', then 'dotnet test', on the repository exactly as you found it, and record the fully-qualified name of every failing test. That is the BASELINE. Capture it before your first edit — do not reconstruct it afterwards by stashing your changes.
 - Update global.json (if present) and every <TargetFramework>/<TargetFrameworks> value to net10.0, preserving OS-specific suffixes (e.g. net8.0-windows becomes net10.0-windows).
 - Update NuGet package references to stable versions compatible with net10.0.
+- Report 'package_decisions': one entry for every package version you change and none for any package you do not, each giving the old version, the new version, why the old version could not stay, and why you picked that specific new version (stable, net10.0-compatible, lowest viable bump).
 - Fix any resulting build or test breaks, including Dockerfile base images and SDK version pins.
 - 'dotnet build' must pass. Then re-run 'dotnet test': every test still failing must already be in the baseline. A test that passed in the baseline and fails now is a regression — fix it. Tests that were already failing may stay failing.
 - If the baseline build did not succeed there is no usable baseline, and the strict bar applies instead: both 'dotnet build' and 'dotnet test' must pass outright.

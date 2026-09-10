@@ -6,6 +6,15 @@ import { retry } from "@octokit/plugin-retry";
 import { throttling } from "@octokit/plugin-throttling";
 import { Octokit } from "@octokit/rest";
 import type { RepoReport } from "./inventory";
+import {
+  capDependencyChanges,
+  diffManifests,
+  emptyDependencyChanges,
+  hasDependencyChanges,
+  isPackageManifest,
+  mergeDependencyChanges,
+  type DependencyChanges,
+} from "./packages";
 
 export type AppConfig = {
   org: string;
@@ -327,6 +336,14 @@ export type Finding = {
   recommendation?: string;
 };
 
+export type PackageDecision = {
+  package: string;
+  from?: string;
+  to?: string;
+  reason: string;
+  evidence?: string;
+};
+
 export type UpgradeResult = {
   schemaVersion: 1;
   repo: string;
@@ -344,6 +361,8 @@ export type UpgradeResult = {
   implementationSummary: string;
   testsRun: string[];
   residualRisks: string[];
+  /** Optional so existing schemaVersion 1 results still validate; parses to [] when absent. */
+  packageDecisions?: PackageDecision[];
 };
 
 export type MarkerVerdict =
@@ -415,6 +434,29 @@ function reqFindingArray(obj: Record<string, unknown>, key: string): Finding[] {
   return v.map((item, i) => parseFinding(item, `${key}[${i}]`));
 }
 
+function parsePackageDecision(value: unknown, decisionPath: string): PackageDecision {
+  if (!isRecord(value)) throw new Error(`invalid upgrade result: ${decisionPath} must be an object`);
+  const pkg = reqResultString(value, "package");
+  if (!pkg.trim()) throw new Error(`invalid upgrade result: ${decisionPath}.package must not be empty`);
+  const reason = reqResultString(value, "reason");
+  if (!reason.trim()) throw new Error(`invalid upgrade result: ${decisionPath}.reason must not be empty`);
+  const decision: PackageDecision = { package: pkg, reason };
+  const from = optString(value, "from");
+  const to = optString(value, "to");
+  const evidence = optString(value, "evidence");
+  if (from !== undefined) decision.from = from;
+  if (to !== undefined) decision.to = to;
+  if (evidence !== undefined) decision.evidence = evidence;
+  return decision;
+}
+
+function optPackageDecisions(obj: Record<string, unknown>, key: string): PackageDecision[] {
+  const v = obj[key];
+  if (v === undefined || v === null) return [];
+  if (!Array.isArray(v)) throw new Error(`invalid upgrade result: ${key} must be an array`);
+  return v.map((item, i) => parsePackageDecision(item, `${key}[${i}]`));
+}
+
 export function parseUpgradeResult(value: unknown): UpgradeResult {
   if (!isRecord(value)) throw new Error("invalid upgrade result: expected an object");
   if (value.schemaVersion !== RESULT_SCHEMA_VERSION) {
@@ -445,6 +487,7 @@ export function parseUpgradeResult(value: unknown): UpgradeResult {
     implementationSummary: reqResultString(value, "implementationSummary"),
     testsRun: reqStringArray(value, "testsRun"),
     residualRisks: reqStringArray(value, "residualRisks"),
+    packageDecisions: optPackageDecisions(value, "packageDecisions"),
   };
 }
 
@@ -491,13 +534,37 @@ export function validateResult(
   return result;
 }
 
+/** Shape of the trailer the writer contract requires at the end of implementationSummary. */
+const MARKER_TRAILER = [
+  /^BASELINE_FAILURES:\s*\S+$/,
+  /^REVIEWERS:\s*\S+$/,
+  /^UPGRADE_RESULT:\s*\S+$/,
+] as const;
+
+/**
+ * Drop a marker trailer the writer already wrote. It is dropped whether or not it agrees with
+ * the parent's values: the parent derives them from the loop ledger and recorded logs, so a
+ * writer trailer that disagrees is stale and must not be what the reader sees.
+ */
+function stripMarkerTrailer(body: string): string {
+  const lines = body.split("\n");
+  const tail: number[] = [];
+  for (let i = lines.length - 1; i >= 0 && tail.length < MARKER_TRAILER.length; i -= 1) {
+    if (lines[i]?.trim()) tail.unshift(i);
+  }
+  const start = tail[0];
+  if (tail.length < MARKER_TRAILER.length || start === undefined) return body;
+  const isTrailer = tail.every((line, i) => MARKER_TRAILER[i]?.test(lines[line]?.trim() ?? ""));
+  return isTrailer ? lines.slice(0, start).join("\n").trimEnd() : body;
+}
+
 export function summaryText(result: UpgradeResult): string {
   const markers = [
     `BASELINE_FAILURES: ${result.baselineFailures}`,
     `REVIEWERS: ${result.reviewers}`,
     `UPGRADE_RESULT: ${result.upgradeResult}`,
   ].join("\n");
-  const body = result.implementationSummary.trimEnd();
+  const body = stripMarkerTrailer(result.implementationSummary.trimEnd());
   return body ? `${body}\n${markers}` : markers;
 }
 
@@ -778,12 +845,192 @@ const PR_PREAMBLE =
   "This pull request was produced by the automated dotnet10-upgrader loop (Cursor engineering-implementation-loop). " +
   "Review the diff and check CI against the test status stated below before merging.";
 
-export function prBody(summary: string, token: string, baselineFailures: number): string {
-  const safe = redact(summary, token);
-  const clipped = safe.length > MAX_SUMMARY_CHARS ? `${safe.slice(0, MAX_SUMMARY_CHARS)}\n…(truncated)` : safe;
-  const longest = Math.max(0, ...[...clipped.matchAll(/`+/g)].map((m) => m[0]?.length ?? 0));
+/** GitHub rejects a pull request body longer than this. */
+export const MAX_BODY_CHARS = 65_536;
+export const MAX_CODE_CHARS = 200;
+export const MAX_TEXT_CHARS = 600;
+export const MAX_DEPENDENCY_SECTION_CHARS = 20_000;
+const MIN_SUMMARY_CHARS = 200;
+const EMPTY_CELL = "—";
+
+/**
+ * Inline code for a short untrusted value (package id, version, path, command). GitHub does not
+ * autolink mentions or issue refs inside a code span, so this is the guard for those; the fence
+ * is longer than any backtick run in the value, and the pipe escape keeps table cells intact.
+ * Returns "" when there is nothing left to render.
+ */
+export function mdCode(value: string, token: string): string {
+  const flat = redact(value, token).replace(/\s+/g, " ").trim();
+  if (!flat) return "";
+  const clipped = flat.length > MAX_CODE_CHARS ? `${flat.slice(0, MAX_CODE_CHARS)}…` : flat;
+  const escaped = clipped.replaceAll("|", "\\|");
+  const longest = Math.max(0, ...[...escaped.matchAll(/`+/g)].map((m) => m[0].length));
+  const fence = "`".repeat(longest + 1);
+  const pad = escaped.startsWith("`") || escaped.endsWith("`") ? " " : "";
+  return `${fence}${pad}${escaped}${pad}${fence}`;
+}
+
+/**
+ * Untrusted prose rendered as markdown text: one line, no HTML, no live mentions or issue refs,
+ * no link syntax, and no way out of a table cell. `@` and `#` become numeric character
+ * references, which render as themselves but are not autolink source text.
+ */
+export function mdText(value: string, token: string): string {
+  const flat = redact(value, token).replace(/\s+/g, " ").trim();
+  if (!flat) return "";
+  const clipped = flat.length > MAX_TEXT_CHARS ? `${flat.slice(0, MAX_TEXT_CHARS)}…` : flat;
+  // Order matters: & is escaped first so it cannot forge an entity, then # is neutralized
+  // before any &#nn; is introduced, and @ last because its replacement contains a #.
+  return clipped
+    .replaceAll("\\", "\\\\")
+    .replaceAll("&", "&amp;")
+    .replaceAll("#", "&#35;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll("[", "&#91;")
+    .replaceAll("]", "&#93;")
+    .replaceAll("`", "&#96;")
+    .replaceAll("|", "\\|")
+    .replaceAll("@", "&#64;");
+}
+
+function versionCell(version: string | undefined, token: string): string {
+  if (version === undefined) return EMPTY_CELL;
+  return mdCode(version, token) || "_(no version attribute)_";
+}
+
+function decisionRange(decision: PackageDecision, token: string): string {
+  if (decision.from === undefined && decision.to === undefined) return "";
+  return ` (${versionCell(decision.from, token)} → ${versionCell(decision.to, token)})`;
+}
+
+function reasonCell(decision: PackageDecision | undefined, token: string): string {
+  if (!decision) return "_No rationale recorded._";
+  const reason = mdText(decision.reason, token) || "_No rationale recorded._";
+  const evidence = decision.evidence ? mdText(decision.evidence, token) : "";
+  return evidence ? `${reason} (evidence: ${evidence})` : reason;
+}
+
+function dependencySection(
+  decisions: PackageDecision[],
+  dependencies: DependencyChanges,
+  token: string,
+): string[] {
+  const lines = ["### Dependency and package reasoning", ""];
+  const claimed = new Set<number>();
+  const matchDecision = (id: string): PackageDecision | undefined => {
+    const key = id.trim().toLowerCase();
+    const i = decisions.findIndex((d, idx) => !claimed.has(idx) && d.package.trim().toLowerCase() === key);
+    if (i < 0) return undefined;
+    claimed.add(i);
+    return decisions[i];
+  };
+
+  if (dependencies.packages.length) {
+    lines.push(
+      "Version moves below are read from the staged diff, not from the agent's report; only the reason column is agent-authored.",
+      "",
+      "| Package | From | To | Source | Reason |",
+      "| :--- | :--- | :--- | :--- | :--- |",
+    );
+    let used = 0;
+    let dropped = 0;
+    for (const change of dependencies.packages) {
+      const decision = matchDecision(change.package);
+      const row = `| ${mdCode(change.package, token) || EMPTY_CELL} | ${versionCell(change.from, token)} | ${versionCell(change.to, token)} | ${mdCode(change.file, token) || EMPTY_CELL} | ${reasonCell(decision, token)} |`;
+      if (used + row.length > MAX_DEPENDENCY_SECTION_CHARS) {
+        dropped += 1;
+        continue;
+      }
+      used += row.length;
+      lines.push(row);
+    }
+    const omitted = dropped + dependencies.omitted;
+    if (omitted > 0) lines.push("", `…${omitted} more change(s) omitted.`);
+  } else {
+    lines.push("No package versions changed; this was a target-framework-only upgrade.");
+  }
+
+  const moves: string[] = [];
+  for (const change of dependencies.frameworks) {
+    moves.push(
+      `- Target frameworks in ${mdCode(change.file, token)}: ${versionCell(change.from, token)} → ${versionCell(change.to, token)}`,
+    );
+  }
+  for (const change of dependencies.sdks) {
+    moves.push(
+      `- SDK pin in ${mdCode(change.file, token)}: ${versionCell(change.from, token)} → ${versionCell(change.to, token)}`,
+    );
+  }
+  for (const change of dependencies.images) {
+    moves.push(
+      `- Base image ${mdCode(change.image, token) || EMPTY_CELL} in ${mdCode(change.file, token)}: ${versionCell(change.from, token)} → ${versionCell(change.to, token)}`,
+    );
+  }
+  if (moves.length) lines.push("", "#### Framework, SDK, and base-image moves", "", ...moves);
+
+  if (dependencies.skipped.length) {
+    const names = dependencies.skipped.map((f) => mdCode(f, token) || EMPTY_CELL).join(", ");
+    lines.push("", `Manifests too large to summarise here: ${names}. Read them in the diff.`);
+  }
+
+  const unmatched = decisions.filter((_, i) => !claimed.has(i));
+  if (unmatched.length) {
+    lines.push("", "#### Decisions recorded with no matching change in the diff", "");
+    for (const decision of unmatched) {
+      lines.push(
+        `- ${mdCode(decision.package, token) || EMPTY_CELL}${decisionRange(decision, token)}: ${reasonCell(decision, token)}`,
+      );
+    }
+  }
+  return lines;
+}
+
+function findingLine(finding: Finding, token: string): string {
+  const where = finding.file ? ` — ${mdCode(finding.file, token)}${finding.line ? `:${mdCode(finding.line, token)}` : ""}` : "";
+  const detail = finding.recommendation ?? finding.impact ?? finding.evidence;
+  const tail = detail ? ` — ${mdText(detail, token)}` : "";
+  return `- ${mdText(finding.severity, token)}: ${mdText(finding.title, token)}${where}${tail}`;
+}
+
+function runSummarySection(result: UpgradeResult, token: string): string[] {
+  const lines = ["### Agent run summary", ""];
+  const verification =
+    result.baselineFailures === 0
+      ? "`dotnet build` and `dotnet test` both passed in the agent's clone."
+      : `\`dotnet build\` passed; \`dotnet test\` still reports the ${result.baselineFailures} failure(s) that were already failing on the base branch, and no others.`;
+  lines.push(
+    `- Verification: ${verification}`,
+    `- Loop verdict: reviewers ${mdCode(result.reviewers, token)}, upgrade ${mdCode(result.upgradeResult, token)}, after ${result.rounds} writer round(s).`,
+  );
+  if (result.testsRun.length) {
+    lines.push("- Commands run:");
+    for (const command of result.testsRun) lines.push(`  - ${mdCode(command, token) || EMPTY_CELL}`);
+  }
+  if (result.baselineFailureNames.length) {
+    lines.push(`- Carried baseline failures (${result.baselineFailureNames.length}):`);
+    for (const name of result.baselineFailureNames) lines.push(`  - ${mdCode(name, token) || EMPTY_CELL}`);
+  }
+  if (result.residualRisks.length) {
+    lines.push("- Residual risks:");
+    for (const risk of result.residualRisks) lines.push(`  - ${mdText(risk, token) || EMPTY_CELL}`);
+  }
+  if (result.warnings.length) {
+    lines.push("- Warnings:");
+    for (const warning of result.warnings) lines.push(`  ${findingLine(warning, token)}`);
+  }
+  return lines;
+}
+
+function fencedSummary(summary: string, budget: number): string {
+  const clipped = summary.length > budget ? `${summary.slice(0, budget)}\n…(truncated)` : summary;
+  const longest = Math.max(0, ...[...clipped.matchAll(/`+/g)].map((m) => m[0].length));
   const fence = "`".repeat(Math.max(3, longest + 1));
-  const details = `<details>\n<summary>Agent run summary</summary>\n\n${fence}text\n${clipped}\n${fence}\n\n</details>`;
+  return `${fence}text\n${clipped}\n${fence}`;
+}
+
+export function prBody(result: UpgradeResult, dependencies: DependencyChanges, token: string): string {
+  const baselineFailures = result.baselineFailures;
   const tests =
     baselineFailures === 0
       ? "`dotnet build` and `dotnet test` both pass — the loop opens no PR otherwise."
@@ -792,7 +1039,11 @@ export function prBody(summary: string, token: string, baselineFailures: number)
   if (baselineFailures > 0) {
     checklist.push(`- [ ] The ${baselineFailures} pre-existing test failure(s) are confirmed on the base branch`);
   }
-  return [
+  const changed = hasDependencyChanges(dependencies)
+    ? "Every version move below is derived from the diff itself."
+    : "No dependency versions moved; the change is confined to target frameworks and code.";
+
+  const head = [
     "## [Dotnet upgrade agent workflow.]()",
     "",
     PR_PREAMBLE,
@@ -807,9 +1058,17 @@ export function prBody(summary: string, token: string, baselineFailures: number)
     "",
     "### ` What changes have we introduced? `",
     "",
-    `Target frameworks (and \`global.json\`, if present) moved to \`net10.0\`, NuGet references updated to net10.0-compatible stable versions, and the resulting build/test breaks fixed. ${tests} The agent's full run summary (untrusted repo output, quoted verbatim):`,
+    `Target frameworks (and \`global.json\`, if present) moved to \`net10.0\`, NuGet references updated to net10.0-compatible stable versions, and the resulting build/test breaks fixed. ${tests} ${changed}`,
     "",
-    details,
+    ...dependencySection(result.packageDecisions ?? [], dependencies, token),
+    "",
+    ...runSummarySection(result, token),
+    "",
+    "The agent's own summary of the run, quoted verbatim (untrusted repo output):",
+    "",
+  ].join("\n");
+
+  const tail = [
     "",
     "#### ` Checklist `",
     "",
@@ -819,6 +1078,54 @@ export function prBody(summary: string, token: string, baselineFailures: number)
     "",
     "None.",
   ].join("\n");
+
+  const summary = redact(summaryText(result), token);
+  const budget = Math.min(MAX_SUMMARY_CHARS, MAX_BODY_CHARS - head.length - tail.length - 64);
+  const block =
+    budget < MIN_SUMMARY_CHARS
+      ? "_Run summary omitted: the sections above already fill GitHub's pull request body limit._"
+      : fencedSummary(summary, budget);
+  const body = `${head}${block}\n${tail}`;
+  return body.length > MAX_BODY_CHARS ? `${body.slice(0, MAX_BODY_CHARS - 16)}\n…(truncated)` : body;
+}
+
+export type GitRunner = (args: string[], cwd: string, token: string, authenticate?: boolean) => string;
+
+/** Manifests read per run; a bound on git calls, well above any real .NET repository. */
+export const MAX_MANIFEST_FILES = 300;
+
+function showBlob(runGit: GitRunner, cloneDir: string, token: string, spec: string): string | undefined {
+  try {
+    return runGit(["show", spec], cloneDir, token);
+  } catch {
+    // the blob does not exist on that side (added or deleted manifest)
+    return undefined;
+  }
+}
+
+/**
+ * Ground truth for the PR's dependency table: compare each staged manifest against its HEAD
+ * blob. HEAD is still baseSha here because the loop never commits, so this must run after
+ * `git add -A` and before `git commit`.
+ */
+export function collectDependencyChanges(
+  cloneDir: string,
+  token: string,
+  stagedPaths: string[],
+  runGit: GitRunner = git,
+): DependencyChanges {
+  let changes = emptyDependencyChanges();
+  const manifests = stagedPaths
+    .filter((p) => p && !p.startsWith('"') && !p.includes("\0"))
+    .filter((p) => !isArtifactPath(p) && isPackageManifest(p))
+    .slice(0, MAX_MANIFEST_FILES);
+  for (const file of manifests) {
+    const before = showBlob(runGit, cloneDir, token, `HEAD:${file}`);
+    const after = showBlob(runGit, cloneDir, token, `:${file}`);
+    if (before === undefined && after === undefined) continue;
+    changes = mergeDependencyChanges(changes, diffManifests(before ?? "", after ?? "", file));
+  }
+  return capDependencyChanges(changes);
 }
 
 export async function finalizeRepo(
@@ -886,6 +1193,8 @@ export async function finalizeRepo(
       return fail(`refusing to open a PR touching protected paths: ${forbidden.slice(0, 5).join(", ")}`);
     }
 
+    const dependencies = collectDependencyChanges(cloneDir, config.token, staged);
+
     git(["commit", "--no-verify", "-m", COMMIT_MESSAGE], cloneDir, config.token);
     git(["push", "--no-verify", "--", manifest.cloneUrl, `${branch}:${branch}`], cloneDir, config.token, true);
 
@@ -897,7 +1206,7 @@ export async function finalizeRepo(
         title: COMMIT_MESSAGE,
         head: branch,
         base: manifest.defaultBranch,
-        body: prBody(summaryText(result), config.token, result.baselineFailures),
+        body: prBody(result, dependencies, config.token),
       }));
     } catch (e) {
       if ((e as { status?: number }).status === 422) {

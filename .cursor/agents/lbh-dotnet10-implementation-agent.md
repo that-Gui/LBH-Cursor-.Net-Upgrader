@@ -71,6 +71,10 @@ When the original request is the .NET 10 playbook (or equivalent):
 - Update NuGet package references to **stable** versions compatible with `net10.0`,
   including `Directory.Packages.props` / Central Package Management, `packages.lock.json`
   / `package.lock.json`, and other lock files the repo already uses.
+- Record the rationale for every package version you move in `package_decisions`
+  (see Required output). Reviewing engineers read that against the diff, so it must
+  cover both halves: why the old version could not stay, and why you picked that
+  specific new version.
 - Fix resulting breaks: Dockerfile / container base images, SDK version pins in
   YAML, `global.json`, `Directory.Build.props`, and similar — only as needed for the upgrade.
 - After edits: `dotnet build` must pass (log `$RUN_DIR/round-$N-build.log`). Then
@@ -152,7 +156,32 @@ implementation_summary: <what you did and why, tied to the request; PLAYBOOK tra
 tests_run: <command and actual result for each, plus log paths under RUN_DIR>
 known_limitations: <what is incomplete, unverified, or deliberately left alone>
 baseline_failure_names: <fully-qualified names still failing; empty if none>
+package_decisions: <one entry per package version you changed — see below; empty if none>
 ```
+
+### `package_decisions`
+
+One entry for **every** package whose version you changed, and **only** for packages you
+actually changed. The parent carries these into `result.json`, and the PR body joins them
+by package id against a table of version changes derived independently from the diff — so
+a decision for a package the diff does not show is flagged, and a changed package with no
+decision leaves an unexplained row. Derive the list from the change set, not from memory.
+
+Each entry:
+
+```text
+- package: <NuGet package id, exactly as it appears in the manifest>
+  from: <version before your change; omit only if the reference is new>
+  to: <version after your change; omit only if you removed the reference>
+  reason: <why the old version could not stay, and why you chose this specific new
+    version — stable (no preview/rc), compatible with net10.0, the lowest viable bump>
+  evidence: <optional — what you checked, e.g. "first stable release targeting net10.0",
+    or the build error the old version produced>
+```
+
+Bumps forced transitively (a package you had to move only because another package or the
+`net10.0` retarget required it) still need an entry saying so. If you left a package on a
+version you are unsure about, say that in `known_limitations` rather than inventing a reason.
 
 When you were given review findings, also report:
 

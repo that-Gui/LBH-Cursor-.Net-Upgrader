@@ -1,4 +1,10 @@
+import type { DependencyChanges } from "../../src/packages";
+import { emptyDependencyChanges } from "../../src/packages";
 import type { RunManifest, RunPhase, UpgradeResult } from "../../src/upgrade";
+
+export function sampleDependencies(partial: Partial<DependencyChanges> = {}): DependencyChanges {
+  return { ...emptyDependencyChanges(), ...partial };
+}
 
 export function sampleResult(partial: Partial<UpgradeResult> = {}): UpgradeResult {
   return {
@@ -18,6 +24,7 @@ export function sampleResult(partial: Partial<UpgradeResult> = {}): UpgradeResul
     implementationSummary: "Moved TFMs to net10.0.",
     testsRun: ["dotnet build — passed", "dotnet test — passed"],
     residualRisks: [],
+    packageDecisions: [],
     ...partial,
   };
 }

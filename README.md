@@ -84,6 +84,8 @@ A PR opens only when `result.json` is finalizable (`schemaVersion` 1, `reviewers
 
 The writer records a pre-edit `dotnet build` / `dotnet test` baseline. Tests that were already red may stay red; a newly failing test blocks the PR.
 
+The PR body carries a dependency and package reasoning section: every version, target-framework, SDK, and base-image change is read from the staged diff, then joined by package id to the writer's recorded reason for the bump, so a reviewer sees why each old version could not stay and why that replacement was chosen. Recorded reasons with no matching change in the diff are listed separately rather than dropped.
+
 On GitHub 422 (branch already has a PR), finalize adopts the existing open PR.
 
 ## Isolation

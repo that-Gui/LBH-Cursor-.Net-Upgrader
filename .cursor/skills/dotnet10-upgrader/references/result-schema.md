@@ -24,7 +24,16 @@ Helpers consume `result.json` during `npm run complete-run -- --run-id <runId>` 
   "warnings": [],
   "implementationSummary": "<what changed and why>",
   "testsRun": ["dotnet build — passed", "dotnet test — passed"],
-  "residualRisks": []
+  "residualRisks": [],
+  "packageDecisions": [
+    {
+      "package": "Microsoft.EntityFrameworkCore",
+      "from": "8.0.4",
+      "to": "10.0.0",
+      "reason": "8.0.4 has no net10.0-compatible assets and failed to restore after the retarget; 10.0.0 is the lowest stable release that supports net10.0.",
+      "evidence": "first stable release with a net10.0 target"
+    }
+  ]
 }
 ```
 
@@ -46,6 +55,22 @@ Helpers consume `result.json` during `npm run complete-run -- --run-id <runId>` 
 | `implementationSummary` | string | Loop Stage 4 summary. Truncate if huge; never include secrets. |
 | `testsRun` | string[] | One line per command and actual result from writer logs. |
 | `residualRisks` | array | Known limitations, carried baseline failures, follow-up work. |
+| `packageDecisions` | array | One entry per package version the writer changed, from its `package_decisions`. Optional in the schema (absent parses as `[]`, so `schemaVersion` stays `1`), but required output for a .NET 10 run. |
+
+### `packageDecisions` entries
+
+| Field | Type | Notes |
+| :--- | :--- | :--- |
+| `package` | string | NuGet package id exactly as it appears in the manifest. |
+| `from` | string? | Version before the change. Omit for a newly added reference. |
+| `to` | string? | Version after the change. Omit for a removed reference. |
+| `reason` | string | Required. Why the old version could not stay **and** why that specific new version was chosen — stable, `net10.0`-compatible, lowest viable bump. |
+| `evidence` | string? | What backs the choice, e.g. `"first stable release with a net10.0 target"` or the restore error the old version produced. |
+
+The PR body joins these to a table of version changes derived independently from the git
+diff. Record one entry for every package whose version changed, and none for packages that
+did not change: an entry with no matching diff row is surfaced separately in the PR, and a
+changed package with no entry leaves an unexplained row.
 
 `complete-run` / `finalize` are allowed only when all of these are true:
 
