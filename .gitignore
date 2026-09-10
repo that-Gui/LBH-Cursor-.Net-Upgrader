@@ -1,6 +1,5 @@
 node_modules/
-work/runs/
-work/logs/
+work/
 .env
 .env.*
 !.env.example

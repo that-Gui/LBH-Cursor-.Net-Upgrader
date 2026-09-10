@@ -94,7 +94,7 @@ The GitHub token lives only in the TypeScript helpers. Subagents are spawned wit
 
 That does **not** cover same-uid process isolation. Subagents can still read the parent environment, `~/.git-credentials`, `~/.netrc`, and any `.env` above `WORK_DIR`. Use a container or dedicated uid if the org's repositories are not all trusted.
 
-`work/repos/` is **not** gitignored so Cursor can see nested clones. `work/runs/` and `work/logs/` **are**. Do not `git add` clones from the upgrader root; mutating Git is always `cwd` / `git -C` against the target clone. If Cursor cannot see `work/repos/<name>`, add it as a multi-root workspace folder for that run.
+All of `work/` is gitignored, so a `git add` from the upgrader root can never record a nested clone as a mode `160000` gitlink. Agents do not need the clones tracked here: they address them by absolute `TARGET_REPO_PATH`, and mutating Git is always `cwd` / `git -C` against the target clone. If Cursor cannot index `work/repos/<name>`, add it as a multi-root workspace folder for that run.
 
 ## Local verification
 
