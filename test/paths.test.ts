@@ -51,6 +51,10 @@ describe("isForbiddenPath", () => {
       assert.ok(fs.existsSync(path.join(hostile, rel)), `missing fixture ${rel}`);
       assert.equal(isForbiddenPath(rel), true, `must refuse hostile ${rel}`);
     }
-    assert.ok(fs.existsSync(path.join(hostile, ".git", "hooks", "pre-commit")));
+    const hook = path.join(hostile, ".git", "hooks", "pre-commit");
+    fs.mkdirSync(path.dirname(hook), { recursive: true });
+    fs.cpSync(path.join(hostile, "pre-commit"), hook);
+    fs.chmodSync(hook, 0o755);
+    assert.ok(fs.existsSync(hook), "missing fixture .git/hooks/pre-commit");
   });
 });

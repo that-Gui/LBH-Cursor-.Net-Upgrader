@@ -3,5 +3,6 @@ work/
 .env
 .env.*
 !.env.example
+!test/fixtures/hostile/.env
 *.log
 .DS_Store
