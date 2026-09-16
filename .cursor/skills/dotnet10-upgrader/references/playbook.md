@@ -10,6 +10,7 @@ Upgrade this repository to .NET 10 (LTS).
 - Do not suppress warnings or audit findings to get a clean build: no new NoWarn, no '#pragma warning disable', no WarningsNotAsErrors, no TreatWarningsAsErrors flip, no NuGetAudit change. A warning that already existed on the base branch stays as it is — name it as a residual risk instead.
 - Report 'package_decisions': one entry for every package version you change and none for any package you do not, each giving the old version, the new version, why the old version could not stay, and why you picked that specific new version (stable, net10.0-compatible, lowest viable bump).
 - Fix any resulting build or test breaks, including Dockerfile base images and SDK version pins.
+- Existing tests may change only where the upgrade genuinely changes the behaviour they assert. Do not delete, skip, or weaken a test to get a green build: no removing test attributes, no 'Skip =', no '[Ignore]', no 'Assert.Inconclusive'. Name any test change and its reason in your summary — a test that was already failing may stay failing, but a test that stops running is an unreported regression.
 - 'dotnet build' must pass. Then re-run 'dotnet test': every test still failing must already be in the baseline. A test that passed in the baseline and fails now is a regression — fix it. Tests that were already failing may stay failing.
 - If the baseline build did not succeed there is no usable baseline, and the strict bar applies instead: both 'dotnet build' and 'dotnet test' must pass outright.
 - Make no changes unrelated to the upgrade.

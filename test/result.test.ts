@@ -1,13 +1,15 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import {
+  finalizableProblems,
   isFinalizable,
+  MAX_ROUNDS,
   parseMarkers,
   parseUpgradeResult,
   summaryText,
   validateResult,
 } from "../src/upgrade";
-import { sampleResult } from "./helpers/sample-result";
+import { populatedResult, SAMPLE_BASE_SHA, sampleResult } from "./helpers/sample-result";
 
 describe("parseMarkers", () => {
   it("accepts green SUCCESS with trailing whitespace and blank lines", () => {
@@ -95,6 +97,7 @@ describe("parseMarkers", () => {
 describe("isFinalizable", () => {
   it("requires PASS, SUCCESS, buildPassed, no regression, and empty unresolvedCriticals", () => {
     assert.equal(isFinalizable(sampleResult()), true);
+    assert.equal(isFinalizable(populatedResult()), true);
     assert.equal(isFinalizable(sampleResult({ reviewers: "FAIL" })), false);
     assert.equal(isFinalizable(sampleResult({ upgradeResult: "FAILED" })), false);
     assert.equal(isFinalizable(sampleResult({ buildPassed: false })), false);
@@ -108,20 +111,78 @@ describe("isFinalizable", () => {
       false,
     );
   });
+
+  it("refuses a critical finding filed under warnings, where the gate would not look", () => {
+    const misfiled = sampleResult({
+      warnings: [
+        { severity: "warning", title: "an advisory that predates the upgrade" },
+        { severity: "critical", title: "src/App.Api/App.Api.csproj still targets net8.0" },
+      ],
+    });
+    assert.equal(isFinalizable(misfiled), false);
+    assert.match(finalizableProblems(misfiled).join("; "), /severity "critical".*unresolvedCriticals/);
+    assert.equal(isFinalizable(sampleResult({ warnings: [{ severity: "suggestion", title: "cpm" }] })), true);
+  });
+
+  it("refuses a rounds value that names no writer round the log gate could read", () => {
+    for (const rounds of [0, 1e21, MAX_ROUNDS + 1]) {
+      assert.equal(isFinalizable(sampleResult({ rounds })), false, `rounds ${rounds}`);
+      assert.match(finalizableProblems(sampleResult({ rounds })).join("; "), /rounds is/);
+    }
+    assert.equal(isFinalizable(sampleResult({ rounds: MAX_ROUNDS })), true);
+  });
+
+  it("refuses an empty testsRun, so the commands actually run are on the record", () => {
+    assert.equal(isFinalizable(sampleResult({ testsRun: [] })), false);
+    assert.match(finalizableProblems(sampleResult({ testsRun: [] })).join("; "), /testsRun is empty/);
+  });
+
+  it("refuses carried failures nothing names", () => {
+    const unnamed = sampleResult({ baselineFailures: 5, baselineFailureNames: [] });
+    assert.equal(isFinalizable(unnamed), false);
+    assert.match(finalizableProblems(unnamed).join("; "), /baselineFailureNames is empty/);
+    assert.equal(
+      isFinalizable(sampleResult({ baselineFailures: 5, baselineFailureNames: ["One.Flaky.Test"] })),
+      true,
+      "naming fewer failures than the count is under-reporting, not a forgery the gate can judge",
+    );
+  });
+
+  it("names every field that failed, so a refusal does not send the operator to the schema", () => {
+    const problems = finalizableProblems(
+      sampleResult({ reviewers: "FAIL", buildPassed: false, rounds: 0, testsRun: [] }),
+    );
+    assert.equal(problems.length, 4);
+    for (const field of ["reviewers", "buildPassed", "rounds", "testsRun"]) {
+      assert.ok(problems.some((p) => p.includes(field)), `${field} must be named`);
+    }
+  });
 });
 
 describe("validateResult", () => {
   const expected = {
     repo: "My.Repo-1_x",
     branch: "chore/dotnet10-upgrade-20260101-120",
-    baseSha: "abc123def456",
+    baseSha: SAMPLE_BASE_SHA,
   };
 
   it("returns the parsed result when identity matches", () => {
     assert.deepEqual(validateResult(sampleResult(), expected), sampleResult());
   });
 
-  it("rejects repo, branch, or baseSha mismatch", () => {
+  it("round-trips a document with every array and optional field populated", () => {
+    const rich = populatedResult();
+    assert.deepEqual(validateResult(rich, expected), rich);
+    const parsed = validateResult(rich, expected);
+    assert.deepEqual(parsed.residualRisks, rich.residualRisks);
+    assert.deepEqual(parsed.warnings, rich.warnings);
+    assert.deepEqual(parsed.baselineFailureNames, rich.baselineFailureNames);
+    assert.deepEqual(parsed.testsRun, rich.testsRun);
+    assert.deepEqual(parsed.packageDecisions, rich.packageDecisions);
+    assert.deepEqual(parsed.testChanges, rich.testChanges);
+  });
+
+  it("rejects repo, branch, or baseSha mismatch, and says what it expected", () => {
     assert.throws(
       () => validateResult(sampleResult({ repo: "other" }), expected),
       /identity mismatch/,
@@ -132,6 +193,20 @@ describe("validateResult", () => {
     );
     assert.throws(
       () => validateResult(sampleResult({ baseSha: "deadbeef" }), expected),
+      (e: Error) =>
+        /identity mismatch/.test(e.message) &&
+        e.message.includes(SAMPLE_BASE_SHA) &&
+        e.message.includes("deadbeef"),
+    );
+  });
+
+  it("rejects a near-miss baseSha rather than a prefix of the expected one", () => {
+    assert.throws(
+      () => validateResult(sampleResult({ baseSha: SAMPLE_BASE_SHA.slice(0, 12) }), expected),
+      /identity mismatch/,
+    );
+    assert.throws(
+      () => validateResult(sampleResult({ baseSha: `${SAMPLE_BASE_SHA} ` }), expected),
       /identity mismatch/,
     );
   });
@@ -257,5 +332,47 @@ describe("packageDecisions", () => {
     assert.throws(withDecisions([{ package: "Serilog" }]), /reason must be a string/);
     assert.throws(withDecisions([{ package: "Serilog", reason: "" }]), /reason must not be empty/);
     assert.throws(withDecisions([{ package: "Serilog", reason: "ok", from: 8 }]), /from must be a string/);
+  });
+});
+
+describe("testChanges", () => {
+  const entry = {
+    file: "test/Ledger.Tests/BalanceTests.cs",
+    change: "asserts DateTimeOffset formatting with the invariant culture",
+    reason: "net10.0 changed the default culture data, and the assertion pinned the old output",
+  };
+
+  it("round-trips a full entry", () => {
+    const parsed = parseUpgradeResult(sampleResult({ testChanges: [entry] }));
+    assert.deepEqual(parsed.testChanges, [entry]);
+  });
+
+  it("defaults to [] when the field is absent, so schemaVersion 1 results still validate", () => {
+    const withoutField: Record<string, unknown> = { ...sampleResult() };
+    delete withoutField.testChanges;
+    assert.equal("testChanges" in withoutField, false);
+    assert.deepEqual(parseUpgradeResult(withoutField).testChanges, []);
+    assert.equal(isFinalizable(parseUpgradeResult(withoutField)), true);
+  });
+
+  it("rejects malformed entries", () => {
+    const withChanges = (testChanges: unknown) => () =>
+      parseUpgradeResult({ ...sampleResult(), testChanges });
+    assert.throws(withChanges("BalanceTests.cs"), /testChanges must be an array/);
+    assert.throws(withChanges(["BalanceTests.cs"]), /testChanges\[0\] must be an object/);
+    assert.throws(withChanges([{ change: entry.change, reason: entry.reason }]), /file must be a string/);
+    assert.throws(withChanges([{ file: entry.file, reason: entry.reason }]), /change must be a string/);
+    assert.throws(withChanges([{ file: entry.file, change: entry.change }]), /reason must be a string/);
+    assert.throws(withChanges([{ ...entry, reason: 8 }]), /reason must be a string/);
+  });
+
+  it("rejects a blank file, change, or reason, as packageDecisions already does", () => {
+    const withChanges = (testChanges: unknown) => () =>
+      parseUpgradeResult({ ...sampleResult(), testChanges });
+    for (const blank of ["", "   ", "\t\n"]) {
+      assert.throws(withChanges([{ ...entry, file: blank }]), /testChanges\[0\]\.file must not be empty/);
+      assert.throws(withChanges([{ ...entry, change: blank }]), /testChanges\[0\]\.change must not be empty/);
+      assert.throws(withChanges([{ ...entry, reason: blank }]), /testChanges\[0\]\.reason must not be empty/);
+    }
   });
 });

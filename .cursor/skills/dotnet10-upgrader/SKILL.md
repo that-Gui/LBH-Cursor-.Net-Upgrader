@@ -55,6 +55,7 @@ Upgrade this repository to .NET 10 (LTS).
 - Do not suppress warnings or audit findings to get a clean build: no new NoWarn, no '#pragma warning disable', no WarningsNotAsErrors, no TreatWarningsAsErrors flip, no NuGetAudit change. A warning that already existed on the base branch stays as it is — name it as a residual risk instead.
 - Report 'package_decisions': one entry for every package version you change and none for any package you do not, each giving the old version, the new version, why the old version could not stay, and why you picked that specific new version (stable, net10.0-compatible, lowest viable bump).
 - Fix any resulting build or test breaks, including Dockerfile base images and SDK version pins.
+- Existing tests may change only where the upgrade genuinely changes the behaviour they assert. Do not delete, skip, or weaken a test to get a green build: no removing test attributes, no 'Skip =', no '[Ignore]', no 'Assert.Inconclusive'. Name any test change and its reason in your summary — a test that was already failing may stay failing, but a test that stops running is an unreported regression.
 - 'dotnet build' must pass. Then re-run 'dotnet test': every test still failing must already be in the baseline. A test that passed in the baseline and fails now is a regression — fix it. Tests that were already failing may stay failing.
 - If the baseline build did not succeed there is no usable baseline, and the strict bar applies instead: both 'dotnet build' and 'dotnet test' must pass outright.
 - Make no changes unrelated to the upgrade.
@@ -134,17 +135,34 @@ Derive `reviewers` / `upgradeResult` from the loop (both reviewers `PASS` with z
 criticals; build passed; no test regression). Do not trust a writer trailer that
 conflicts with the ledger or logs.
 
+The writer reports in snake_case; `result.json` is camelCase. **Rename the key on every
+one of these copies** — `package_decisions` → `packageDecisions`, `test_changes` →
+`testChanges`, `baseline_failure_names` → `baselineFailureNames`. "Verbatim" below refers
+to the entries, never to the key name. `packageDecisions` and `testChanges` are optional in
+the schema, so a leftover snake_case key is dropped as an unknown field with no error: both
+parse as `[]`, the result still validates and still looks finalizable, and the run dies
+later at finalize with `refusing to open a PR that weakens tests with no recorded reason`
+for a change the writer did explain.
+
 Copy the last writer round's `package_decisions` into `packageDecisions` verbatim — the
 PR body joins those reasons to a version-change table read straight from the diff. Do not
 write reasons the writer did not give, and do not drop entries you cannot match to the
 diff; finalize surfaces unmatched ones rather than hiding them. If a .NET 10 run changed
 package versions and the writer reported none, note that in the audit.
 
+Copy the last writer round's `test_changes` into `testChanges` verbatim on the same terms —
+finalize reads the staged diff and refuses the pull request when a test file is deleted, a
+test attribute is removed, or a skip or inconclusive assertion is added with no entry
+naming that file. Do not write a justification the writer did not give, and do not drop an
+entry; a test weakening nobody can explain is a reason to leave the run local.
+
 #### d. Finalize or leave local
 
 **Only if** `reviewers` is `PASS` **and** `upgradeResult` is `SUCCESS` **and**
 `buildPassed` **and** `testsRegressed` is false **and** there are no unresolved
-criticals:
+criticals **and** the final loop round's build and test logs exist under
+`$WORK_DIR/runs/<runId>/` and show a passing build with no failing test absent from the
+baseline:
 
 ```bash
 npm run complete-run -- --run-id RUN_ID
@@ -182,7 +200,9 @@ in the parent.
 **Writer (every round):** new Task, `subagent_type: lbh-dotnet10-implementation-agent`,
 `run_in_background: false`. **Do not pass `resume`.** Prompt = ordered handoff from
 the loop skill (original playbook, `TARGET_REPO_PATH`, `RUN_ID`, `RUN_DIR`,
-`BASELINE_SHA`, `BASELINE_RESULTS`, ledger, findings, required output).
+`ROUND_NUMBER`, `BASELINE_SHA`, `BASELINE_RESULTS`, ledger, findings, required output).
+State `ROUND_NUMBER` as a number each round; it is the `$N` in `round-$N-build.log` and
+`round-$N-test.log`, and the reviewers look for exactly that pair.
 
 **Reviewers (after the writer finishes):** two Task calls in the **same** parent
 message, `lbh-dotnet10-adversarial-reviewer` and `lbh-dotnet10-architectural-reviewer`,

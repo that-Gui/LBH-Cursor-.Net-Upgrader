@@ -70,8 +70,10 @@ Restate these in every stage prompt; subagents start with no memory of this conv
   linter/formatter config, existing patterns) before proposing or making changes.
 - Make the smallest correct change that satisfies the request.
 - No drive-by refactors, renames, reformatting, or cleanup outside the approved scope.
-- Never run `git commit`, `git push`, `git reset`, `git revert`, `git checkout --`,
-  or any other history- or state-rewriting command. Reading state is allowed:
+- Never run `git commit`, `git push`, `git reset`, `git revert`, `git checkout`,
+  `git switch`, `git restore`, `git stash`, `git rebase`, `git cherry-pick`, `git add`,
+  or any other history- or state-changing command. A workspace hook blocks these, and a
+  blocked command must be reported rather than worked around. Reading state is allowed:
   `git rev-parse`, `git status`, `git diff`, `git ls-files` — always with
   `git -C "$TARGET_REPO_PATH"` and `cwd` = `TARGET_REPO_PATH`.
 - Never claim success without verification. "It should work" is not a result.
@@ -105,7 +107,12 @@ after the writer belongs to this task.
 Every prompt you send to a subagent must contain, in this order:
 
 1. **Original request** — verbatim, unedited. Pass it to every stage, including re-reviews.
-2. **Clone and run** — `TARGET_REPO_PATH`, `RUN_ID`, `RUN_DIR`.
+2. **Clone and run** — `TARGET_REPO_PATH`, `RUN_ID`, `RUN_DIR`, and `ROUND_NUMBER`: the
+   current round `N`, stated as a number. Every stage needs it, because both the writer's
+   log filenames and the reviewers' log lookups are `round-$N-build.log` /
+   `round-$N-test.log`. Omitting it from the writer's prompt makes the writer guess a
+   number the reviewers will not look for, and a missing log for the current round is a
+   blocking critical the next round cannot clear.
 3. **Baseline** — `BASELINE_SHA`, `BASELINE_RESULTS` (writer-captured build/test
    evidence and fully-qualified failing test names after round 1; on round 1 tell the
    writer it must capture them **before the first edit**), plus the two commands above.
@@ -156,8 +163,20 @@ Launch a **fresh** `lbh-dotnet10-implementation-agent` (new Task; never `resume`
 
 Always include clone/run, baseline, and the rejection ledger.
 
-Expect back: `changed_files`, `implementation_summary`, `tests_run`,
-`known_limitations`, and from round 2 on, `triage_decisions`.
+State `ROUND_NUMBER` explicitly in the prompt — `ROUND_NUMBER: 1` on the first round,
+`ROUND_NUMBER: 2` on the second, and so on — and tell the writer to persist this round's
+logs as `$RUN_DIR/round-$N-build.log` and `$RUN_DIR/round-$N-test.log` with `$N` set to
+that number. The writer has no memory of earlier rounds and cannot infer `N`, and the
+reviewers in Stage 2 look for exactly that pair.
+
+Expect back: `changed_files`, `diff_stat`, `implementation_summary`, `tests_run`,
+`known_limitations`, `test_changes`, `package_decisions`, `baseline_failure_names`, and
+from round 2 on, `triage_decisions`.
+
+The last two are easy to forget and both are load-bearing at Stage 4:
+`baseline_failure_names` becomes the required `baselineFailureNames` in `result.json`, and
+`package_decisions` becomes `packageDecisions`, which the pull-request body joins against
+the diff.
 
 When it reports, snapshot the change set into the run directory:
 
@@ -175,6 +194,14 @@ Only after the writer has finished, launch **both** reviewers in **one message**
 Give each the original request, clone/run, baseline, writer's summary and test
 results, **paths to persisted logs** (do not ask them to rerun builds), and the
 rejection ledger.
+
+Name the current round number `N` and the exact log paths in the handoff:
+`$RUN_DIR/round-$N-build.log`, `$RUN_DIR/round-$N-test.log`, and
+`$RUN_DIR/baseline-test.log`. Instruct the adversarial reviewer to read this round's two
+logs and compare them against `BASELINE_RESULTS` and the baseline test log, raising a
+`critical` when a log is missing, when it predates the newest file in the change set, or
+when a test that passed in the baseline fails in it. That comparison is what replaces
+rerunning the suite, so it happens every round.
 
 Rounds 2+: also pass prior critical findings and `$RUN_DIR/impl-loop-round-(N-1).diff`,
 and instruct each reviewer to verify every prior critical is actually fixed before
@@ -239,6 +266,26 @@ Use `completed` only when both reviewers returned `PASS` and verification passed
 from failures documented as pre-existing baseline. Use `blocked` when the loop hit the
 round cap or Stage 0 cleanliness failed. Use `partially_completed` when part of the
 request landed and verified but part did not.
+
+You cannot run `dotnet` either — it writes `bin/` and `obj/` into the clone — so the
+recorded logs are your only verification. `status: completed` additionally requires that
+the final writer round's build and test logs exist under `RUN_DIR` and show a passing
+build with no failing test that is absent from the baseline. If either log is missing, or
+contradicts the writer's trailer, the status is `partially_completed` or `blocked`, and
+the report says which log was missing or what it actually showed.
+
+Carry the last writer round's `test_changes` through to `result.json` as `testChanges`,
+its `package_decisions` through as `packageDecisions`, and its `baseline_failure_names`
+through as `baselineFailureNames`. Copy the entries unchanged and **rename the key**:
+`result.json` is camelCase and the parser matches key names exactly, so a leftover
+snake_case key is dropped as unknown without any error. `testChanges` and
+`packageDecisions` then parse as `[]`, the result still validates and still looks
+finalizable, and the first symptom is finalize refusing the pull request for a test change
+the writer did justify.
+
+The finalize gate refuses a pull request whose diff weakens a test with no matching entry,
+so dropping the field — or leaving it under the writer's key name — turns a justified test
+change into a blocked run.
 
 Close by listing outstanding warnings and suggestions. They did not block the loop;
 they are the operator's to decide on.

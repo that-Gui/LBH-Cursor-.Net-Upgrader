@@ -6,6 +6,7 @@ import { fileURLToPath } from "node:url";
 import {
   buildInventory,
   classify,
+  EXCLUSIONS,
   formatInventory,
   inspectRepo,
   MAX_FETCHES_PER_REPO,
@@ -229,6 +230,39 @@ describe("formatInventory", () => {
     assert.match(text, /Excluded — netstandard-only: std/);
     assert.match(text, /Excluded — incomplete scan: partial/);
     assert.ok(!text.split("\n")[1]?.includes("partial"));
+  });
+
+  it("reports every classification the queue drops, with its reason", async () => {
+    const octokit = mockOctokit([
+      { name: "needs", tree: [{ path: "App.csproj", content: csproj("net8") }] },
+      { name: "modern", tree: [{ path: "App.csproj", content: csproj("net10") }] },
+      { name: "old-fx", tree: [{ path: "App.csproj", content: csproj("framework") }] },
+      { name: "std", tree: [{ path: "Lib.csproj", content: csproj("netstandard", "Lib.csproj") }] },
+      { name: "docs-only", tree: [{ path: "README.md", content: "no projects here" }] },
+      { name: "partial", truncated: true, tree: [{ path: "App.csproj", content: csproj("net8") }] },
+    ]);
+    const reports = await buildInventory(octokit, { org: "o", activeMonths: 12 });
+    const text = formatInventory(reports);
+
+    assert.match(text, /^Upgrade queue \(1\):/m, "only the needs-upgrade repo is queued");
+    assert.match(text, /Excluded — already on \.NET 10 or later: modern/, "up-to-date must state its reason");
+    assert.match(text, /Excluded — no \.NET project found: docs-only/, "no-dotnet must state its reason");
+    assert.match(text, /Excluded — \.NET Framework: old-fx/);
+    assert.match(text, /Excluded — netstandard-only: std/);
+    assert.match(text, /Excluded — incomplete scan: partial/);
+
+    const unexplained = reports
+      .filter((r) => r.classification !== "needs-upgrade")
+      .filter((r) => !new RegExp(`^Excluded — .*\\b${r.name}\\b`, "m").test(text))
+      .map((r) => `${r.name} (${r.classification})`);
+    assert.deepEqual(unexplained, [], "every scanned repo the queue drops is listed under an exclusion");
+  });
+
+  it("names an empty bucket rather than dropping the line", () => {
+    const text = formatInventory([report({ name: "only", classification: "needs-upgrade", tfms: ["net8.0"] })]);
+    for (const [, reason] of EXCLUSIONS) {
+      assert.ok(text.includes(`Excluded — ${reason}: (none)`), `${reason} keeps its line when empty`);
+    }
   });
 });
 

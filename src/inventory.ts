@@ -158,6 +158,15 @@ export function classify(tfms: string[], sdkVersion: string | undefined): Classi
   return tfms.some((t) => /^netstandard/i.test(t)) ? "netstandard-only" : "no-dotnet";
 }
 
+/** Why a scanned repo is not in the queue, in the order an operator is likely to ask. */
+export const EXCLUSIONS: readonly (readonly [Exclude<Classification, "needs-upgrade">, string])[] = [
+  ["framework", ".NET Framework"],
+  ["netstandard-only", "netstandard-only"],
+  ["no-dotnet", "no .NET project found"],
+  ["up-to-date", "already on .NET 10 or later"],
+  ["incomplete", "incomplete scan"],
+];
+
 export function formatInventory(reports: RepoReport[]): string {
   const queue = upgradeQueue(reports);
   const lines: string[] = [`Upgrade queue (${queue.length}):`];
@@ -167,8 +176,9 @@ export function formatInventory(reports: RepoReport[]): string {
   }
   const names = (c: Classification) =>
     reports.filter((r) => r.classification === c).map((r) => r.name).join(", ") || "(none)";
-  lines.push(`Excluded — .NET Framework: ${names("framework")}`);
-  lines.push(`Excluded — netstandard-only: ${names("netstandard-only")}`);
-  lines.push(`Excluded — incomplete scan: ${names("incomplete")}`);
+  // Every classification the queue drops, so a scanned repo's absence always has a stated reason.
+  for (const [classification, reason] of EXCLUSIONS) {
+    lines.push(`Excluded — ${reason}: ${names(classification)}`);
+  }
   return lines.join("\n");
 }

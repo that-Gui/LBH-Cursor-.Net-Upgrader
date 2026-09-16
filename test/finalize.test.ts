@@ -1,15 +1,22 @@
 import { after, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import os from "node:os";
 import path from "node:path";
 import type { Octokit } from "@octokit/rest";
+import { MAX_DEPENDENCY_ROWS } from "../src/packages";
 import {
+  ARTIFACT_EXCLUDES,
+  collectDependencyChanges,
   COMMIT_MESSAGE,
   finalizeRepo,
   git,
+  markLoopComplete,
   MAX_BODY_CHARS,
+  MAX_MANIFEST_FILES,
   mdCode,
   mdText,
   prBody,
@@ -20,7 +27,13 @@ import {
   writeResult,
   type AppConfig,
 } from "../src/upgrade";
-import { sampleDependencies, sampleManifest, sampleResult } from "./helpers/sample-result";
+import {
+  passingTestLog,
+  sampleDependencies,
+  sampleManifest,
+  sampleResult,
+  writeRoundLogs,
+} from "./helpers/sample-result";
 
 const token = "ghs_finalize_test_token";
 const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "finalize-"));
@@ -282,7 +295,56 @@ describe("prBody", () => {
   it("states the upgrade scope so an unforced bump reads as out of place", () => {
     const body = prBody(sampleResult(), changedPackage, token);
     assert.ok(body.includes("a package version moves here only where the `net10.0` retarget forced it"));
-    assert.ok(body.includes("this PR adds no warning suppressions"));
+  });
+
+  it("claims what the gates check and no more", () => {
+    const body = prBody(sampleResult(), changedPackage, token);
+    assert.ok(
+      body.includes("finalize scanned the committed diff and would have refused it outright"),
+      "the claim is about what was checked, not an unconditional assertion about the diff",
+    );
+    assert.ok(
+      !body.includes("this PR adds no warning suppressions"),
+      "an unconditional claim is false whenever the scan can be bypassed",
+    );
+    assert.ok(
+      !/otherwise weakened/.test(body),
+      "the detectors do not check a gutted test body that keeps its [Fact], so nothing may claim they do",
+    );
+    assert.ok(
+      body.includes("they do not judge whether a test that kept its `[Fact]` still asserts as much as it did"),
+      "the limit of the test scan has to be stated where the claim is made",
+    );
+  });
+
+  it("states where the tests stand and lists the ones the upgrade changed", () => {
+    const body = prBody(
+      sampleResult({
+        testChanges: [
+          {
+            file: "Tests/App.Tests/LedgerTests.cs",
+            change: "Balances now asserts the invariant-culture format",
+            reason: "net10.0 ships different culture data",
+          },
+        ],
+      }),
+      changedPackage,
+      token,
+    );
+    assert.ok(body.includes("#### Tests the upgrade changed"));
+    assert.ok(
+      body.includes("Every row is a change the weakening scan either found in the diff or would have refused the PR over"),
+      "the list of skipped tests has to read coherently against the claim above it",
+    );
+    assert.ok(
+      body.includes(
+        "- `Tests/App.Tests/LedgerTests.cs` — Balances now asserts the invariant-culture format (net10.0 ships different culture data)",
+      ),
+    );
+  });
+
+  it("omits the changed-tests subsection when the run changed none", () => {
+    assert.ok(!prBody(sampleResult(), changedPackage, token).includes("#### Tests the upgrade changed"));
   });
 
   it("lists a new package reference separately with its recorded evidence", () => {
@@ -382,17 +444,140 @@ function csprojFixture(
   ].join("\n");
 }
 
-function setupRun(opts: {
-  change?: "source" | "cursor" | "none" | "suppress" | "added";
-  phase?: "prepared" | "loop-complete";
-  result?: ReturnType<typeof sampleResult>;
-}): {
+const TEST_FILE = "Tests/App.Tests/LedgerTests.cs";
+const SOURCE_FILE = "src/Domain/Ledger.cs";
+/** Nested projects, an import, an SDK pin and a Dockerfile: the layout a real repo has. */
+const DOMAIN_PROJECT = "src/App.Domain/App.Domain.csproj";
+const TEST_PROJECT = "Tests/App.Tests/App.Tests.csproj";
+
+function projectFixture(tfm: string, packages: [string, string][]): string {
+  return [
+    '<Project Sdk="Microsoft.NET.Sdk">',
+    "  <PropertyGroup>",
+    `    <TargetFramework>${tfm}</TargetFramework>`,
+    "  </PropertyGroup>",
+    "  <ItemGroup>",
+    ...packages.map(([id, v]) => `    <PackageReference Include="${id}" Version="${v}" />`),
+    "  </ItemGroup>",
+    "</Project>",
+    "",
+  ].join("\n");
+}
+
+function buildPropsFixture(): string {
+  return [
+    "<Project>",
+    "  <PropertyGroup>",
+    "    <LangVersion>latest</LangVersion>",
+    "    <Nullable>enable</Nullable>",
+    "    <TreatWarningsAsErrors>true</TreatWarningsAsErrors>",
+    "  </PropertyGroup>",
+    "</Project>",
+    "",
+  ].join("\n");
+}
+
+function globalJsonFixture(version: string): string {
+  return `${JSON.stringify({ sdk: { version, rollForward: "latestFeature" } }, null, 2)}\n`;
+}
+
+function dockerfileFixture(tag: string): string {
+  return [
+    `FROM mcr.microsoft.com/dotnet/sdk:${tag} AS build`,
+    "WORKDIR /src",
+    "COPY . .",
+    "RUN dotnet publish -c Release -o /app",
+    "",
+    `FROM mcr.microsoft.com/dotnet/aspnet:${tag}`,
+    "WORKDIR /app",
+    "COPY --from=build /app .",
+    'ENTRYPOINT ["dotnet", "App.dll"]',
+    "",
+  ].join("\n");
+}
+
+/** The committed test class; `attribute` is the line that registers the method with the runner. */
+function testFixture(attribute = "  [Fact]"): string {
+  return [
+    "namespace App.Tests;",
+    "",
+    "public class LedgerTests",
+    "{",
+    ...(attribute ? [attribute] : []),
+    "  public void Balances() => Assert.Equal(2, 1 + 1);",
+    "}",
+    "",
+  ].join("\n");
+}
+
+/** Production code carrying a weakening-shaped line, to show the gate reads test paths only. */
+function sourceFixture(skip = false): string {
+  return [
+    "namespace App.Domain;",
+    "",
+    "public sealed class Ledger",
+    "{",
+    ...(skip ? ['  public const string Skip = "reserved for the ledger export";'] : []),
+    "  public int Balance() => 1;",
+    "}",
+    "",
+  ].join("\n");
+}
+
+type Change =
+  | "source"
+  | "cursor"
+  | "github-workflow"
+  | "none"
+  | "suppress"
+  | "added"
+  | "delete-test"
+  | "remove-fact"
+  | "skip-fact"
+  | "weaken-source"
+  | "new-project"
+  | "windows-artifacts"
+  | "all-three";
+
+type RunContext = {
   workDir: string;
   runId: string;
+  dir: string;
   cloneDir: string;
+  bare: string;
   upgradeBranch: string;
+  baseSha: string;
   config: AppConfig;
-} {
+};
+
+/** The retarget every scenario shares: TFMs, the SDK pin, and the container base images. */
+function retarget(cloneDir: string, newtonsoft = "13.0.3"): void {
+  fs.writeFileSync(path.join(cloneDir, "App.csproj"), csprojFixture("net10.0", newtonsoft));
+  fs.writeFileSync(path.join(cloneDir, DOMAIN_PROJECT), projectFixture("net10.0", [["Serilog", "2.12.0"]]));
+  fs.writeFileSync(
+    path.join(cloneDir, TEST_PROJECT),
+    projectFixture("net10.0", [["xunit", "2.4.2"], ["Microsoft.NET.Test.Sdk", "17.6.0"]]),
+  );
+  fs.writeFileSync(path.join(cloneDir, "global.json"), globalJsonFixture("10.0.100"));
+  fs.writeFileSync(path.join(cloneDir, "Dockerfile"), dockerfileFixture("10.0"));
+}
+
+function write(cloneDir: string, rel: string, body: string): void {
+  const file = path.join(cloneDir, rel);
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  fs.writeFileSync(file, body);
+}
+
+function setupRun(opts: {
+  change?: Change;
+  phase?: "prepared" | "loop-complete";
+  result?: Partial<ReturnType<typeof sampleResult>>;
+  /** Commit part of the work on the branch before finalize runs, as a loop must not. */
+  preCommit?: (cloneDir: string) => void;
+  /** Skip the complete-run gate, leaving the phase written straight to disk. */
+  forgePhase?: boolean;
+  roundLogs?: { build?: string; test?: string } | false;
+}): RunContext {
   const workDir = fs.mkdtempSync(path.join(tmpRoot, "work-"));
   const repo = "My.Repo-1_x";
   const runId = `${repo}-20260101-120`;
@@ -403,53 +588,113 @@ function setupRun(opts: {
 
   fs.mkdirSync(cloneDir, { recursive: true, mode: 0o700 });
   rawGit(["init", "-b", "main", cloneDir], workDir);
-  fs.writeFileSync(path.join(cloneDir, "App.csproj"), csprojFixture("net8.0", "12.0.3"));
-  rawGit(["add", "App.csproj"], cloneDir);
+  write(cloneDir, "App.csproj", csprojFixture("net8.0", "12.0.3"));
+  write(cloneDir, DOMAIN_PROJECT, projectFixture("net8.0", [["Serilog", "2.12.0"]]));
+  write(cloneDir, TEST_PROJECT, projectFixture("net8.0", [["xunit", "2.4.2"], ["Microsoft.NET.Test.Sdk", "17.6.0"]]));
+  write(cloneDir, "Directory.Build.props", buildPropsFixture());
+  write(cloneDir, "global.json", globalJsonFixture("8.0.100"));
+  write(cloneDir, "Dockerfile", dockerfileFixture("8.0"));
+  write(cloneDir, TEST_FILE, testFixture());
+  write(cloneDir, SOURCE_FILE, sourceFixture());
+  rawGit(["add", "-A"], cloneDir);
   rawGit(["commit", "-m", "init"], cloneDir);
   rawGit(["checkout", "-b", upgradeBranch], cloneDir);
   const baseSha = rawGit(["rev-parse", "HEAD"], cloneDir).trim();
 
+  if (opts.preCommit) {
+    opts.preCommit(cloneDir);
+    rawGit(["add", "-A"], cloneDir);
+    rawGit(["commit", "-m", "wip: the loop committed, which it must not"], cloneDir);
+  }
+
   if (opts.change === "cursor") {
-    fs.mkdirSync(path.join(cloneDir, ".cursor"), { recursive: true });
-    fs.writeFileSync(path.join(cloneDir, ".cursor", "rules.md"), "planted\n");
+    write(cloneDir, ".cursor/rules.md", "planted\n");
+  } else if (opts.change === "github-workflow") {
+    write(cloneDir, ".github/wörkflow.yml", "planted\n");
   } else if (opts.change === "suppress") {
+    retarget(cloneDir);
     fs.writeFileSync(path.join(cloneDir, "App.csproj"), csprojFixture("net10.0", "13.0.3", { noWarn: true }));
   } else if (opts.change === "added") {
+    retarget(cloneDir);
     fs.writeFileSync(
       path.join(cloneDir, "App.csproj"),
       csprojFixture("net10.0", "13.0.3", { added: "Brand.New.Pkg" }),
     );
+  } else if (opts.change === "delete-test") {
+    retarget(cloneDir);
+    fs.rmSync(path.join(cloneDir, TEST_FILE));
+  } else if (opts.change === "remove-fact") {
+    retarget(cloneDir);
+    write(cloneDir, TEST_FILE, testFixture(""));
+  } else if (opts.change === "skip-fact") {
+    retarget(cloneDir);
+    write(cloneDir, TEST_FILE, testFixture('  [Fact(Skip = "net10.0 rounds the balance differently")]'));
+  } else if (opts.change === "weaken-source") {
+    retarget(cloneDir);
+    write(cloneDir, SOURCE_FILE, sourceFixture(true));
+  } else if (opts.change === "new-project") {
+    retarget(cloneDir);
+    write(cloneDir, "src/App.Workers/App.Workers.csproj", projectFixture("net10.0", [["Serilog", "2.12.0"]]));
+    write(cloneDir, "src/App.Workers/Worker.cs", "namespace App.Workers;\npublic class Worker {}\n");
+  } else if (opts.change === "windows-artifacts") {
+    retarget(cloneDir);
+    // Windows-cased build output the repository committed long ago, carrying a suppression.
+    write(cloneDir, "Obj/Debug/Generated.cs", "#pragma warning disable CS1591\nclass Generated {}\n");
+    write(cloneDir, "TESTRESULTS/run.cs", "// [Fact] removed by the runner\n");
+  } else if (opts.change === "all-three") {
+    retarget(cloneDir);
+    fs.writeFileSync(
+      path.join(cloneDir, "App.csproj"),
+      csprojFixture("net10.0", "13.0.3", { noWarn: true, added: "Brand.New.Pkg" }),
+    );
+    fs.rmSync(path.join(cloneDir, TEST_FILE));
   } else if (opts.change !== "none") {
-    fs.writeFileSync(path.join(cloneDir, "App.csproj"), csprojFixture("net10.0", "13.0.3"));
+    retarget(cloneDir);
   }
 
   rawGit(["init", "--bare", "-b", "main", bare], workDir);
 
-  const manifest = sampleManifest(workDir, cloneDir, {
-    runId,
-    phase: opts.phase ?? "loop-complete",
-    repo,
-    upgradeBranch,
-    baseSha,
-    cloneUrl: bare,
-  });
-  writeManifest(dir, manifest);
-  writeResult(
+  const phase = opts.phase ?? "loop-complete";
+  writeManifest(
     dir,
-    sampleResult({
-      ...opts.result,
+    sampleManifest(workDir, cloneDir, {
+      runId,
+      phase: "prepared",
       repo,
-      branch: upgradeBranch,
+      upgradeBranch,
       baseSha,
+      cloneUrl: bare,
     }),
   );
+  writeResult(dir, sampleResult({ ...opts.result, repo, branch: upgradeBranch, baseSha }));
+  if (opts.roundLogs !== false) writeRoundLogs(dir, opts.result?.rounds ?? 1, opts.roundLogs ?? {});
   writePristineGitConfig(dir, fs.readFileSync(path.join(cloneDir, ".git", "config")));
+
+  if (phase === "loop-complete") {
+    // The gate the operator runs between the loop and finalize; it records the digests
+    // finalize re-checks. A scenario that deliberately has no evidence to gate, or a result
+    // the gate would reject, writes the phase straight to disk instead — which is exactly the
+    // forgery finalize has to catch on its own.
+    const forge = () =>
+      writeManifest(dir, { ...readManifest(dir), phase: "loop-complete" });
+    if (opts.forgePhase) forge();
+    else {
+      try {
+        markLoopComplete(workDir, runId);
+      } catch {
+        forge();
+      }
+    }
+  }
 
   return {
     workDir,
     runId,
+    dir,
     cloneDir,
+    bare,
     upgradeBranch,
+    baseSha,
     config: {
       org: "LBHackney",
       token,
@@ -457,6 +702,18 @@ function setupRun(opts: {
       batchSize: 4,
       activeMonths: 12,
     },
+  };
+}
+
+/** The tree on the branch the bare remote received, which is what a reviewer would see. */
+function pushedTree(ctx: RunContext): { files: string[]; read: (file: string) => string } {
+  const files = rawGit(["ls-tree", "-r", "--name-only", ctx.upgradeBranch], ctx.bare)
+    .split("\n")
+    .map((l) => l.trim())
+    .filter(Boolean);
+  return {
+    files,
+    read: (file) => rawGit(["show", `${ctx.upgradeBranch}:${file}`], ctx.bare),
   };
 }
 
@@ -586,6 +843,123 @@ describe("finalizeRepo", () => {
     assert.ok(body.includes("- `Brand.New.Pkg` at `1.0.0` in `App.csproj` — required by: round-1-build.log"));
   });
 
+  it("refuses a staged diff that deletes a test file", async () => {
+    const ctx = setupRun({ change: "delete-test" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /weakens tests with no recorded reason/);
+    assert.match(outcome.reason ?? "", /Tests\/App\.Tests\/LedgerTests\.cs \(deleted test file\)/);
+    assert.equal(pulls.created, 0);
+    assert.equal(git(["log", "-1", "--format=%s"], ctx.cloneDir, token).trim(), "init");
+  });
+
+  it("refuses a staged diff that removes a [Fact] attribute", async () => {
+    const ctx = setupRun({ change: "remove-fact" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /weakens tests with no recorded reason/);
+    assert.match(outcome.reason ?? "", /Tests\/App\.Tests\/LedgerTests\.cs \(\[Fact\]\)/);
+    assert.equal(pulls.created, 0);
+  });
+
+  it("refuses a staged diff that skips a test", async () => {
+    const ctx = setupRun({ change: "skip-fact" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /weakens tests with no recorded reason/);
+    assert.match(outcome.reason ?? "", /Tests\/App\.Tests\/LedgerTests\.cs \(Skip =\)/);
+    assert.equal(pulls.created, 0);
+  });
+
+  it("opens the PR when a recorded testChanges entry names the weakened file", async () => {
+    const ctx = setupRun({
+      change: "skip-fact",
+      result: sampleResult({
+        testChanges: [
+          {
+            file: TEST_FILE,
+            change: "Balances is skipped pending a rounding fix",
+            reason: "net10.0 rounds the balance differently; the assertion pinned the old output",
+          },
+        ],
+      }),
+    });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, true);
+    assert.equal(pulls.created, 1);
+    const body = (pulls.createArgs[0] as { body?: string }).body ?? "";
+    assert.ok(body.includes("#### Tests the upgrade changed"));
+    assert.ok(
+      body.includes(
+        "- `Tests/App.Tests/LedgerTests.cs` — Balances is skipped pending a rounding fix (net10.0 rounds the balance differently; the assertion pinned the old output)",
+      ),
+    );
+  });
+
+  it("does not treat a blank reason or another file as justification", async () => {
+    for (const testChanges of [
+      [{ file: TEST_FILE, change: "skipped", reason: "   " }],
+      [{ file: "Tests/App.Tests/OtherTests.cs", change: "skipped", reason: "unrelated" }],
+    ]) {
+      const ctx = setupRun({ change: "skip-fact", result: sampleResult({ testChanges }) });
+      const pulls = mockPulls({});
+      const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+      assert.equal(outcome.ok, false, `justified by ${JSON.stringify(testChanges)}`);
+      // A blank reason is now rejected by the parser, before it can waive anything.
+      assert.match(
+        outcome.reason ?? "",
+        /weakens tests with no recorded reason|reason must not be empty/,
+      );
+      assert.equal(pulls.created, 0);
+    }
+  });
+
+  it("accepts a testChanges path spelled with a leading ./", async () => {
+    const ctx = setupRun({
+      change: "skip-fact",
+      result: sampleResult({
+        testChanges: [
+          {
+            file: `./${TEST_FILE}`,
+            change: "Balances is skipped pending a rounding fix",
+            reason: "net10.0 rounds the balance differently",
+          },
+        ],
+      }),
+    });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, true, outcome.reason);
+    assert.equal(pulls.created, 1);
+  });
+
+  it("does not accept a bare basename, which names a file in every test project", async () => {
+    const ctx = setupRun({
+      change: "skip-fact",
+      result: sampleResult({
+        testChanges: [
+          { file: "LedgerTests.cs", change: "skipped", reason: "net10.0 rounds the balance differently" },
+        ],
+      }),
+    });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /weakens tests with no recorded reason/);
+  });
+
+  it("ignores a weakening-shaped line outside the test suite", async () => {
+    const ctx = setupRun({ change: "weaken-source" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, true);
+    assert.equal(pulls.created, 1);
+  });
+
   it("refuses a clone whose .git is not a directory", async () => {
     const ctx = setupRun({ change: "source" });
     fs.rmSync(path.join(ctx.cloneDir, ".git"), { recursive: true, force: true });
@@ -595,5 +969,362 @@ describe("finalizeRepo", () => {
     assert.equal(outcome.ok, false);
     assert.match(outcome.reason ?? "", /\.git is not a directory/);
     assert.equal(pulls.created, 0);
+  });
+
+  it("retargets a multi-project layout, the SDK pin and the Dockerfile in one PR", async () => {
+    const ctx = setupRun({ change: "source" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, true, outcome.reason);
+    const body = (pulls.createArgs[0] as { body?: string }).body ?? "";
+    for (const moved of [
+      "Target frameworks in `App.csproj`: `net8.0` → `net10.0`",
+      "Target frameworks in `src/App.Domain/App.Domain.csproj`: `net8.0` → `net10.0`",
+      "Target frameworks in `Tests/App.Tests/App.Tests.csproj`: `net8.0` → `net10.0`",
+      "SDK pin in `global.json`: `8.0.100` → `10.0.100`",
+      "Base image `mcr.microsoft.com/dotnet/sdk` in `Dockerfile`: `8.0` → `10.0`",
+      "Base image `mcr.microsoft.com/dotnet/aspnet` in `Dockerfile`: `8.0` → `10.0`",
+    ]) {
+      assert.ok(body.includes(moved), `missing ${moved}`);
+    }
+  });
+
+  it("refuses when HEAD has moved off baseSha, because the gates only read the index", async () => {
+    const ctx = setupRun({
+      change: "source",
+      // Committed on the branch: a suppression, a new package and a deleted test, none of
+      // which `git diff --cached` would ever show, all of which `git push branch:branch` sends.
+      preCommit: (cloneDir) => {
+        fs.writeFileSync(
+          path.join(cloneDir, "App.csproj"),
+          csprojFixture("net8.0", "12.0.3", { noWarn: true, added: "Brand.New.Pkg" }),
+        );
+        fs.rmSync(path.join(cloneDir, TEST_FILE));
+      },
+    });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /the writer loop committed on the branch/);
+    assert.match(outcome.reason ?? "", new RegExp(`records baseSha ${ctx.baseSha}`));
+    assert.equal(pulls.created, 0);
+    assert.equal(
+      rawGit(["ls-remote", "--heads", ctx.bare], ctx.workDir).trim(),
+      "",
+      "nothing may reach the remote",
+    );
+    assert.equal(
+      rawGit(["log", "-1", "--format=%s"], ctx.cloneDir).trim(),
+      "wip: the loop committed, which it must not",
+      "the refusal must not add a commit of its own",
+    );
+    assert.equal(
+      rawGit(["diff", "--cached", "--name-only"], ctx.cloneDir).trim(),
+      "",
+      "the refusal happens before git add -A, so the index is untouched",
+    );
+    assert.equal(readManifest(ctx.dir).phase, "loop-complete");
+  });
+
+  it("pushes a branch a reviewer can trust: no suppression, no missing test", async () => {
+    const ctx = setupRun({ change: "source" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, true, outcome.reason);
+
+    // Asserted on the remote, not on the outcome: whatever route a suppression or a deleted
+    // test takes into the branch, this is where it would have to show up.
+    const pushed = pushedTree(ctx);
+    assert.ok(pushed.files.includes(TEST_FILE), "the test file must still be on the pushed branch");
+    assert.ok(pushed.files.includes(TEST_PROJECT));
+    for (const file of pushed.files) {
+      const content = pushed.read(file);
+      for (const token of ["NoWarn", "#pragma warning disable", "Skip =", "IsTestProject"]) {
+        assert.ok(!content.includes(token), `${file} on the pushed branch carries ${token}`);
+      }
+    }
+    assert.ok(pushed.read("App.csproj").includes("net10.0"), "the upgrade itself did reach the remote");
+    assert.equal(
+      rawGit(["rev-list", "--count", `${ctx.baseSha}..${ctx.upgradeBranch}`], ctx.bare).trim(),
+      "1",
+      "exactly one commit, the one the gates scanned",
+    );
+  });
+
+  it("refuses a forged loop-complete manifest with no round logs", async () => {
+    const ctx = setupRun({ change: "source", forgePhase: true, roundLogs: false });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /no persisted round build\/test logs/);
+    assert.equal(pulls.created, 0);
+    assert.equal(rawGit(["log", "-1", "--format=%s"], ctx.cloneDir).trim(), "init");
+    assert.equal(readManifest(ctx.dir).phase, "loop-complete", "the phase is not advanced to finalized");
+  });
+
+  it("refuses a forged loop-complete manifest whose round logs say the suite failed", async () => {
+    const ctx = setupRun({
+      change: "source",
+      forgePhase: true,
+      roundLogs: { test: "Failed! - Failed: 41, Passed: 0, Skipped: 0, Total: 41\n" },
+    });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /counts 41 failure\(s\)/);
+    assert.equal(pulls.created, 0);
+  });
+
+  it("refuses a run whose evidence the complete-run gate never reviewed", async () => {
+    const ctx = setupRun({ change: "source", forgePhase: true });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /carries no gate digest/);
+    assert.equal(pulls.created, 0);
+  });
+
+  it("refuses the waivers a result.json gained after the gate reviewed it", async () => {
+    // The run is gated with no waiver in the document, exactly as the reviewer saw it.
+    const ctx = setupRun({ change: "skip-fact" });
+    const gated = readManifest(ctx.dir);
+    assert.ok(gated.resultDigest, "the fixture must have gone through the complete-run gate");
+
+    // Then the two fields that launder a weakened test and an unexplained package appear.
+    writeResult(
+      ctx.dir,
+      sampleResult({
+        repo: "My.Repo-1_x",
+        branch: ctx.upgradeBranch,
+        baseSha: ctx.baseSha,
+        testChanges: [{ file: TEST_FILE, change: "skipped", reason: "appended after the gate" }],
+        packageDecisions: [{ package: "Brand.New.Pkg", reason: "appended too", evidence: "none" }],
+      }),
+    );
+
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /result\.json changed after run .* was gated/);
+    assert.ok((outcome.reason ?? "").includes(gated.resultDigest ?? ""), "the refusal names the gated digest");
+    assert.equal(pulls.created, 0);
+    assert.equal(rawGit(["log", "-1", "--format=%s"], ctx.cloneDir).trim(), "init");
+  });
+
+  it("refuses round logs rewritten after the gate read them", async () => {
+    const ctx = setupRun({ change: "source" });
+    writeRoundLogs(ctx.dir, 1, { test: passingTestLog(0, 99) });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /round build\/test logs changed after run .* was gated/);
+    assert.equal(pulls.created, 0);
+  });
+
+  it("names every violated gate, not just the first", async () => {
+    const ctx = setupRun({ change: "all-three" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    const reason = outcome.reason ?? "";
+    assert.match(reason, /3 gate violation\(s\)/);
+    assert.match(reason, /adds warning suppressions: App\.csproj \(NoWarn\)/);
+    assert.match(reason, /adds package reference\(s\) with no recorded evidence: Brand\.New\.Pkg in App\.csproj/);
+    assert.match(reason, /weakens tests with no recorded reason: Tests\/App\.Tests\/LedgerTests\.cs/);
+    assert.equal(pulls.created, 0);
+  });
+
+  it("opens a PR for a new project and lists the references it declares", async () => {
+    const ctx = setupRun({ change: "new-project" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, true, outcome.reason);
+    assert.equal(pulls.created, 1);
+    const body = (pulls.createArgs[0] as { body?: string }).body ?? "";
+    assert.ok(body.includes("#### References declared by project files this PR adds"));
+    assert.ok(body.includes("- `Serilog` at `2.12.0` in `src/App.Workers/App.Workers.csproj`"));
+    assert.ok(
+      !body.includes("#### New package references"),
+      "a new project's own references are not new packages in a project that already existed",
+    );
+  });
+
+  it("still demands evidence for a package added to a project that already existed", async () => {
+    const ctx = setupRun({ change: "added" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /Brand\.New\.Pkg in App\.csproj/);
+  });
+
+  it("still reads a test the base branch marked binary in .gitattributes", async () => {
+    const ctx = setupRun({ change: "skip-fact" });
+    // Committed on the base branch, so the gate cannot refuse it as a protected-path edit.
+    // Without --text every .cs file diffs as "Binary files … differ" and the scan sees nothing.
+    rawGit(["stash", "-u"], ctx.cloneDir);
+    write(ctx.cloneDir, ".gitattributes", "*.cs binary\n");
+    rawGit(["add", ".gitattributes"], ctx.cloneDir);
+    rawGit(["commit", "--amend", "--no-edit"], ctx.cloneDir);
+    rawGit(["stash", "pop"], ctx.cloneDir);
+    const baseSha = rawGit(["rev-parse", "HEAD"], ctx.cloneDir).trim();
+    writeResult(
+      ctx.dir,
+      sampleResult({ repo: "My.Repo-1_x", branch: ctx.upgradeBranch, baseSha }),
+    );
+    writeManifest(ctx.dir, { ...readManifest(ctx.dir), phase: "prepared", baseSha });
+    markLoopComplete(ctx.workDir, ctx.runId);
+
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /weakens tests with no recorded reason/);
+    assert.equal(pulls.created, 0);
+  });
+
+  it("ignores Windows-cased build output rather than hard-failing on it", async () => {
+    const ctx = setupRun({ change: "windows-artifacts" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, true, outcome.reason);
+    assert.equal(pulls.created, 1);
+  });
+
+  it("writes the redacted log it names, on success and on refusal", async () => {
+    const ok = setupRun({ change: "source" });
+    const okOutcome = await finalizeRepo(mockPulls({}).octokit, ok.config, ok.runId);
+    assert.equal(okOutcome.ok, true, okOutcome.reason);
+    assert.equal(okOutcome.logPath, path.join(ok.workDir, "logs", "My.Repo-1_x.log"));
+    const okLog = fs.readFileSync(okOutcome.logPath ?? "", "utf8");
+    assert.match(okLog, /finalize run My\.Repo-1_x-20260101-120/);
+    assert.match(okLog, /evidence verified/);
+    assert.match(okLog, /opened https:\/\/github\.com/);
+    assert.ok(!okLog.includes(token), "the log must not carry the token");
+
+    const bad = setupRun({ change: "suppress" });
+    const badOutcome = await finalizeRepo(mockPulls({}).octokit, bad.config, bad.runId);
+    assert.equal(badOutcome.ok, false);
+    assert.ok(badOutcome.logPath, "a failure outcome must not name a log it did not write");
+    const badLog = fs.readFileSync(badOutcome.logPath ?? "", "utf8");
+    assert.match(badLog, /REFUSED: refusing to open a PR, 1 gate violation/);
+  });
+
+  it("leaves the index and the exclude file as it found them when it refuses", async () => {
+    const ctx = setupRun({ change: "suppress" });
+    const excludeFile = path.join(ctx.cloneDir, ".git", "info", "exclude");
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const outcome = await finalizeRepo(mockPulls({}).octokit, ctx.config, ctx.runId);
+      assert.equal(outcome.ok, false);
+      assert.equal(
+        rawGit(["diff", "--cached", "--name-only"], ctx.cloneDir).trim(),
+        "",
+        "a refused finalize must leave the clone as the loop left it",
+      );
+      assert.ok(rawGit(["status", "--porcelain"], ctx.cloneDir).trim().length > 0, "the work is still there");
+    }
+    const lines = fs.readFileSync(excludeFile, "utf8").split("\n").filter(Boolean);
+    for (const pattern of ARTIFACT_EXCLUDES) {
+      assert.equal(
+        lines.filter((l) => l.trim() === pattern).length,
+        1,
+        `${pattern} must appear once however many times finalize ran`,
+      );
+    }
+  });
+
+  it("refuses a C-quoted non-ASCII .github path and does not call pulls.create", async () => {
+    const ctx = setupRun({ change: "github-workflow" });
+    rawGit(["add", "-A"], ctx.cloneDir);
+    const listed = rawGit(["diff", "--cached", "--name-only"], ctx.cloneDir);
+    assert.ok(
+      listed.includes("\\") && listed.includes('"'),
+      `git must C-quote the non-ASCII staged path so this test is not vacuous, got ${JSON.stringify(listed)}`,
+    );
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /refusing to open a PR touching protected paths/);
+    assert.ok(
+      (outcome.reason ?? "").includes("wörkflow.yml"),
+      `refusal must name the unquoted path, got ${JSON.stringify(outcome.reason)}`,
+    );
+    assert.equal(pulls.created, 0);
+  });
+});
+
+describe("collectDependencyChanges", () => {
+  it("refuses a diff with more manifests than it can scan instead of slicing silently", () => {
+    const paths = Array.from(
+      { length: MAX_MANIFEST_FILES + 1 },
+      (_, i) => `aaa/Filler${String(i).padStart(4, "0")}/Filler.csproj`,
+    );
+    const runGit = () => "";
+    assert.throws(
+      () => collectDependencyChanges("/nowhere", token, [...paths, "zzz/Smuggler/Smuggler.csproj"], runGit),
+      /more than the 300 this scan reads; refusing to open a PR on a partial dependency scan/,
+    );
+    assert.doesNotThrow(() => collectDependencyChanges("/nowhere", token, paths.slice(1), runGit));
+  });
+
+  it("refuses a diff with more dependency rows than it can scan instead of slicing silently", () => {
+    const over = Array.from(
+      { length: MAX_MANIFEST_FILES },
+      (_, i) => `aaa/Filler${String(i).padStart(4, "0")}/Filler.csproj`,
+    );
+    // Same TFM on both sides so each manifest contributes exactly one added package row,
+    // not a package row plus a framework row. Empty HEAD + a full projectFixture would
+    // double-count and make MAX_DEPENDENCY_ROWS - 1 manifests overflow the cap too.
+    const runGit = (args: string[]) =>
+      (args[1] ?? "").startsWith("HEAD:")
+        ? projectFixture("net10.0", [])
+        : projectFixture("net10.0", [["Brand.New.Pkg", "1.0.0"]]);
+    assert.throws(
+      () => collectDependencyChanges("/nowhere", token, over, runGit),
+      new RegExp(
+        `more than the ${MAX_DEPENDENCY_ROWS} this scan reads; refusing to open a PR on a partial dependency scan`,
+      ),
+    );
+    assert.doesNotThrow(() =>
+      collectDependencyChanges("/nowhere", token, over.slice(0, MAX_DEPENDENCY_ROWS - 1), runGit),
+    );
+  });
+});
+
+describe("markLoopComplete", () => {
+  it("hashes the same result.json bytes the gate reviewed, from a single read", () => {
+    const ctx = setupRun({ phase: "prepared" });
+    const original = fs.readFileSync;
+    const resultReads: Buffer[] = [];
+    const wrap = ((...args: Parameters<typeof original>) => {
+      const filePath = args[0];
+      if (typeof filePath === "string" && filePath.endsWith("result.json")) {
+        if (resultReads.length >= 1) {
+          const tampered = `${JSON.stringify(sampleResult({ implementationSummary: "tampered" }), null, 2)}\n`;
+          const buf = Buffer.from(tampered);
+          resultReads.push(buf);
+          return args[1] === undefined ? buf : tampered;
+        }
+        const data = original.apply(fs, args);
+        resultReads.push(Buffer.isBuffer(data) ? data : Buffer.from(String(data)));
+        return data;
+      }
+      return original.apply(fs, args);
+    }) as typeof original;
+
+    try {
+      fs.readFileSync = wrap;
+      // upgrade.ts uses `import * as fs from "node:fs"` (the ESM namespace). Patching
+      // the CJS export alone does not update that snapshot until this runs.
+      syncBuiltinESMExports();
+      markLoopComplete(ctx.workDir, ctx.runId);
+    } finally {
+      fs.readFileSync = original;
+      syncBuiltinESMExports();
+    }
+
+    assert.equal(resultReads.length, 1, "the gate and the digest must share one read of result.json");
+    const first = resultReads[0];
+    assert.ok(first, "the intercepted read must record its bytes");
+    assert.equal(readManifest(ctx.dir).resultDigest, createHash("sha256").update(first).digest("hex"));
   });
 });
