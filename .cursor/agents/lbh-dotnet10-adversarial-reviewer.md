@@ -1,6 +1,6 @@
 ---
 name: lbh-dotnet10-adversarial-reviewer
-description: Read-only adversarial reviewer for the .NET 10 engineering implementation loop. Reviews git diff BASELINE_SHA in TARGET_REPO_PATH plus untracked files and recorded build/test logs. Hunts correctness defects, new restore/build/test failures versus evidence, leftover TFMs, package vulnerabilities, runtime incompatibility, and missed Docker/SDK pins. Never runs dotnet build or test.
+description: Read-only adversarial reviewer for the .NET 10 engineering implementation loop. Reviews git diff BASELINE_SHA in TARGET_REPO_PATH plus untracked files and recorded build/test logs. Hunts correctness defects, new restore/build/test failures versus evidence, leftover TFMs, unforced package churn, unexplained new package references, new warning suppressions, runtime incompatibility, and missed Docker/SDK pins. Never runs dotnet build or test.
 model: claude-opus-5-thinking-high
 readonly: true
 is_background: false
@@ -35,6 +35,9 @@ code and recorded evidence show otherwise.
   from the working tree. The clone was required to be clean at Stage 0.
 - Failures listed in `BASELINE_RESULTS` (and baseline logs) predate this change.
   They are not findings unless the writer claimed a clean baseline they contradict.
+- Warnings and vulnerability advisories that already applied on the base branch are
+  **out of scope**. Do not ask for them to be fixed, upgraded away, or silenced here;
+  the upgrade did not introduce them. Ask only that the diff leave them alone.
 - Judge the change against the original request and the writer's implementation summary.
 - **Re-review rounds** — when the prompt lists prior critical findings and the path to
   the previous round's diff, first verify each prior critical is actually fixed, then
@@ -53,8 +56,19 @@ code and recorded evidence show otherwise.
     test log is a regression.
   - Unsupported or pre-net10 TFMs left behind (`net6.0`, `net7.0`, `net8.0`,
     `net9.0`, `netcoreapp*`, etc.) without an OS-suffix-preserving `net10.0` replacement.
-  - Increased package vulnerability exposure (known-vulnerable version bumps, or
-    leaving a package the upgrade should have moved off when the diff shows that).
+  - A bump **into** a known-vulnerable version (the diff moves a package onto a version
+    with a published advisory).
+  - A package version move the retarget did not force — the version in `BASELINE_SHA` is
+    `net10.0`-compatible and no recorded restore/build error or transitive constraint
+    required the move. A vulnerability advisory against the old version is **not** such a
+    reason: fixing it is a separate pull request, and doing it here is noise.
+  - A **new** `PackageReference`, `PackageVersion`, or `GlobalPackageReference` the base
+    branch did not have, with no restore/build error in the logs proving the upgrade
+    cannot pass without it.
+  - A **new warning or audit suppression**: added `NoWarn`, `#pragma warning disable`,
+    `WarningsNotAsErrors`, a `TreatWarningsAsErrors` flip, or a `NuGetAudit` /
+    `NuGetAuditMode` / `NuGetAuditLevel` change. A warning that already fired on the base
+    branch was not introduced by this change, so silencing it here does not belong in the diff.
   - Broken runtime compatibility (TFM/OS suffix dropped, RID/runtimeconfig mismatch,
     Windows-only TFM changed to plain `net10.0` or the reverse without cause).
   - Dockerfile base images or SDK pins (`global.json`, pipeline SDK, `includePrefix`)

@@ -4,8 +4,10 @@ import {
   capDependencyChanges,
   diffManifests,
   emptyDependencyChanges,
+  findSuppressions,
   isPackageManifest,
   MAX_MANIFEST_BYTES,
+  MAX_SUPPRESSIONS,
   parseDockerImages,
   parsePackageVersions,
   parseSdkPin,
@@ -260,5 +262,81 @@ describe("capDependencyChanges", () => {
   it("leaves a change set under the cap untouched", () => {
     const changes = emptyDependencyChanges();
     assert.equal(capDependencyChanges(changes), changes);
+  });
+});
+
+function hunk(file: string, lines: string[]): string {
+  return [
+    `diff --git a/${file} b/${file}`,
+    "index 1111111..2222222 100644",
+    `--- a/${file}`,
+    `+++ b/${file}`,
+    "@@ -1,0 +1,1 @@",
+    ...lines,
+    "",
+  ].join("\n");
+}
+
+describe("findSuppressions", () => {
+  it("reports an added pragma with its file, construct, and collapsed text", () => {
+    const found = findSuppressions(hunk("src/Program.cs", ["+    #pragma warning disable   CS0618"]));
+    assert.deepEqual(found, [
+      { file: "src/Program.cs", line: "#pragma warning disable CS0618", token: "#pragma warning disable" },
+    ]);
+  });
+
+  it("reports each MSBuild construct that silences a diagnostic", () => {
+    const cases: [string, string][] = [
+      ["  <NoWarn>$(NoWarn);CS1591</NoWarn>", "NoWarn"],
+      ["  <WarningsNotAsErrors>CS8600</WarningsNotAsErrors>", "WarningsNotAsErrors"],
+      ["  <TreatWarningsAsErrors>false</TreatWarningsAsErrors>", "TreatWarningsAsErrors"],
+      ["  <NuGetAuditMode>direct</NuGetAuditMode>", "NuGetAudit"],
+      ["  <NuGetAudit>false</NuGetAudit>", "NuGetAudit"],
+    ];
+    for (const [line, token] of cases) {
+      const found = findSuppressions(hunk("Directory.Build.props", [`+${line}`]));
+      assert.equal(found.length, 1, `expected ${line} to be reported`);
+      assert.equal(found[0]?.token, token);
+      assert.equal(found[0]?.file, "Directory.Build.props");
+    }
+  });
+
+  it("leaves alone what the diff does not introduce: removed lines, context, and warnings-as-errors turned on", () => {
+    const removed = findSuppressions(hunk("App.csproj", ["-  <NoWarn>CS1591</NoWarn>", "   <PropertyGroup>"]));
+    assert.deepEqual(removed, []);
+    const stricter = findSuppressions(hunk("App.csproj", ["+  <TreatWarningsAsErrors>true</TreatWarningsAsErrors>"]));
+    assert.deepEqual(stricter, []);
+  });
+
+  it("skips files the caller ignores", () => {
+    const diff = hunk("obj/Debug/App.g.cs", ["+#pragma warning disable CS0618"]);
+    assert.deepEqual(findSuppressions(diff, (f) => f.startsWith("obj/")), []);
+    assert.equal(findSuppressions(diff).length, 1);
+  });
+
+  it("reads `+++` as a header only where the diff puts one", () => {
+    const pathOnly = findSuppressions(hunk("build/NoWarn.props", ["+  <PropertyGroup>"]));
+    assert.deepEqual(pathOnly, [], "a path containing NoWarn is not an added suppression");
+
+    const content = findSuppressions(hunk("docs/notes.md", ["+++ NoWarn is off now"]));
+    assert.deepEqual(content, [
+      { file: "docs/notes.md", line: "++ NoWarn is off now", token: "NoWarn" },
+    ]);
+  });
+
+  it("attributes findings to the file section they appear in", () => {
+    const diff = [
+      hunk("A.csproj", ["+  <NoWarn>CS1591</NoWarn>"]),
+      hunk("src/B.cs", ["+#pragma warning disable CS0618"]),
+    ].join("");
+    assert.deepEqual(
+      findSuppressions(diff).map((s) => s.file),
+      ["A.csproj", "src/B.cs"],
+    );
+  });
+
+  it("stops at the reporting cap", () => {
+    const lines = Array.from({ length: MAX_SUPPRESSIONS + 10 }, () => "+  <NoWarn>CS1591</NoWarn>");
+    assert.equal(findSuppressions(hunk("App.csproj", lines)).length, MAX_SUPPRESSIONS);
   });
 });

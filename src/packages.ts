@@ -304,6 +304,83 @@ function diffImages(before: string, after: string, file: string): ImageChange[] 
   return changes;
 }
 
+/** Hard cap on reported suppressions; the gate only needs enough to name the problem. */
+export const MAX_SUPPRESSIONS = 50;
+/** Added lines are clipped to this length in a suppression report. */
+export const MAX_SUPPRESSION_CHARS = 120;
+
+export type Suppression = {
+  file: string;
+  /** The added line's text, whitespace-collapsed and clipped. */
+  line: string;
+  /** The construct that matched, for the refusal message. */
+  token: string;
+};
+
+/**
+ * Constructs that silence a diagnostic instead of fixing it. A warning that already fired
+ * on the base branch was not introduced by the upgrade, so adding any of these to the diff
+ * is out of scope for a retarget.
+ */
+export const SUPPRESSION_PATTERNS: readonly { token: string; pattern: RegExp }[] = [
+  { token: "#pragma warning disable", pattern: /#\s*pragma\s+warning\s+disable\b/i },
+  { token: "NoWarn", pattern: /\bNoWarn\b/i },
+  { token: "WarningsNotAsErrors", pattern: /\bWarningsNotAsErrors\b/i },
+  { token: "TreatWarningsAsErrors", pattern: /\bTreatWarningsAsErrors\s*[>=]\s*["']?\s*false\b/i },
+  { token: "NuGetAudit", pattern: /\bNuGetAudit(?:Mode|Level)?\b/i },
+];
+
+function diffTarget(header: string): string | undefined {
+  const raw = header.slice(4).split("\t")[0]?.trim();
+  if (!raw || raw === "/dev/null") return undefined;
+  return raw.startsWith("b/") ? raw.slice(2) : raw;
+}
+
+/**
+ * Suppressions introduced by a unified diff (`git diff --cached -U0`). Only added lines
+ * count: a suppression the base branch already carried is not this change's doing.
+ * `ignoreFile` keeps build output out of the report; callers pass their artifact test.
+ */
+export function findSuppressions(diff: string, ignoreFile: (file: string) => boolean = () => false): Suppression[] {
+  const found: Suppression[] = [];
+  let file: string | undefined;
+  let ignored = true;
+  // A `+++` line is the target header only directly after a `---` line; anywhere else it
+  // is an added line that happens to start with `++`.
+  let header = false;
+  for (const raw of diff.split(/\r?\n/)) {
+    if (raw.startsWith("diff --git ")) {
+      file = undefined;
+      ignored = true;
+      header = false;
+      continue;
+    }
+    if (raw.startsWith("--- ")) {
+      header = true;
+      continue;
+    }
+    if (header && raw.startsWith("+++ ")) {
+      header = false;
+      file = diffTarget(raw);
+      ignored = file === undefined || ignoreFile(file);
+      continue;
+    }
+    header = false;
+    if (ignored || file === undefined || !raw.startsWith("+")) continue;
+    const content = raw.slice(1);
+    const match = SUPPRESSION_PATTERNS.find((s) => s.pattern.test(content));
+    if (!match) continue;
+    const flat = content.replace(/\s+/g, " ").trim();
+    found.push({
+      file,
+      line: flat.length > MAX_SUPPRESSION_CHARS ? `${flat.slice(0, MAX_SUPPRESSION_CHARS)}…` : flat,
+      token: match.token,
+    });
+    if (found.length >= MAX_SUPPRESSIONS) break;
+  }
+  return found;
+}
+
 /** Compare the two sides of one changed manifest. Either side may be "" for add/delete. */
 export function diffManifests(before: string, after: string, file: string): DependencyChanges {
   const changes = emptyDependencyChanges();

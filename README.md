@@ -82,11 +82,19 @@ Only `needs-upgrade` on complete evidence reaches the write path. A scan is inco
 
 A PR opens only when `result.json` is finalizable (`schemaVersion` 1, `reviewers` PASS, `upgradeResult` SUCCESS, `buildPassed`, no test regression, empty `unresolvedCriticals`, identity matching the manifest) **and** Git gates pass: HEAD still on the upgrade branch, at least one staged non-artifact change, nothing staged under `.github/`, `.claude/`, `.cursor/`, `.ssh/`, `.gitattributes`, `.gitmodules`, `.npmrc`, `.netrc`, `.envrc`, or `.env*`. Any failure leaves the local clone and a redacted log.
 
+Two staged-diff gates keep the PR to the retarget: nothing added may silence a warning (`NoWarn`, `#pragma warning disable`, `WarningsNotAsErrors`, `TreatWarningsAsErrors` set false, `NuGetAudit*`), and every package reference the base branch did not have needs `evidence` in the writer's `packageDecisions` — the restore or build error the upgrade cannot pass without it. Both read the diff, not the agent's report, and both name the offending file in the failure reason.
+
 The writer records a pre-edit `dotnet build` / `dotnet test` baseline. Tests that were already red may stay red; a newly failing test blocks the PR.
 
-The PR body carries a dependency and package reasoning section: every version, target-framework, SDK, and base-image change is read from the staged diff, then joined by package id to the writer's recorded reason for the bump, so a reviewer sees why each old version could not stay and why that replacement was chosen. Recorded reasons with no matching change in the diff are listed separately rather than dropped.
+The PR body carries a dependency and package reasoning section: every version, target-framework, SDK, and base-image change is read from the staged diff, then joined by package id to the writer's recorded reason for the bump, so a reviewer sees why each old version could not stay and why that replacement was chosen. New references are listed again on their own with the evidence that required them, and recorded reasons with no matching change in the diff are listed separately rather than dropped.
 
 On GitHub 422 (branch already has a PR), finalize adopts the existing open PR.
+
+## What stays out of the upgrade
+
+A retarget PR that also bumps a package nothing forced, pulls in a package the project does not need, or silences a warning that was already firing spends reviewing time on changes the upgrade did not require. The playbook, the writer, and both reviewers say so in the same terms: a package version moves only where the retarget forces it, no reference the repository did not already have is added without a build error proving it necessary, and pre-existing warnings and vulnerability advisories are left alone and reported as residual risks rather than fixed or suppressed here.
+
+Whether a given bump was forced is a judgement rather than a pattern, so that one belongs to the reviewers: the adversarial reviewer treats an unforced bump — including one motivated only by an advisory against the version already on the base branch — as a critical finding, and no PR opens while a critical is unresolved.
 
 ## Isolation
 

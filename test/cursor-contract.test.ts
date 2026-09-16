@@ -85,6 +85,50 @@ describe("loop skill contract", () => {
   });
 });
 
+const playbookStart = "Upgrade this repository to .NET 10 (LTS).";
+
+/** The request text itself, without the wrapper prose each copy adds around it. */
+function playbookBody(text: string): string {
+  const start = text.indexOf(playbookStart);
+  assert.ok(start >= 0, "missing the playbook request text");
+  const marker = text.indexOf("UPGRADE_RESULT:", start);
+  assert.ok(marker >= 0, "missing the UPGRADE_RESULT marker line");
+  const eol = text.indexOf("\n", marker);
+  return text.slice(start, eol === -1 ? text.length : eol);
+}
+
+describe("playbook contract", () => {
+  it("keeps the reference copy and the inline copy identical", () => {
+    assert.equal(
+      playbookBody(read("skills/dotnet10-upgrader/references/playbook.md")),
+      playbookBody(read(skills.upgrader)),
+    );
+  });
+
+  it("keeps the upgrade scope rules the loop is judged against", () => {
+    const playbook = playbookBody(read("skills/dotnet10-upgrader/references/playbook.md"));
+    assert.match(playbook, /only where the retarget forces the move/);
+    assert.match(playbook, /vulnerability advisory[\s\S]*is not a reason to move it/);
+    assert.match(playbook, /Do not add a package reference the repository did not already have/);
+    assert.match(playbook, /Do not suppress warnings or audit findings/);
+  });
+
+  it("repeats those rules to the writer and makes them criticals for the adversarial reviewer", () => {
+    const writer = read(agents.writer);
+    assert.match(writer, /only where the retarget forces it/i);
+    assert.match(writer, /Do not add a package reference the repository did not already have/);
+    assert.match(writer, /Do not suppress warnings or audit findings/);
+    assert.match(writer, /evidence` is mandatory/);
+
+    const adversarial = read(agents.adversarial);
+    assert.match(adversarial, /the retarget did not force/);
+    assert.match(adversarial, /no restore\/build error in the logs/);
+    assert.match(adversarial, /new warning or audit suppression/i);
+
+    assert.match(read(agents.architectural), /new warning or audit suppression/i);
+  });
+});
+
 describe("upgrader skill contract", () => {
   it("mentions inventory|run, prepare-repo, complete-run, finalize, result.json, and sequential batching", () => {
     const text = read(skills.upgrader);

@@ -10,10 +10,13 @@ import {
   capDependencyChanges,
   diffManifests,
   emptyDependencyChanges,
+  findSuppressions,
   hasDependencyChanges,
   isPackageManifest,
   mergeDependencyChanges,
   type DependencyChanges,
+  type PackageChange,
+  type Suppression,
 } from "./packages";
 
 export type AppConfig = {
@@ -850,6 +853,8 @@ export const MAX_BODY_CHARS = 65_536;
 export const MAX_CODE_CHARS = 200;
 export const MAX_TEXT_CHARS = 600;
 export const MAX_DEPENDENCY_SECTION_CHARS = 20_000;
+/** New references are rare by policy; list enough to review and count the rest. */
+const MAX_ADDED_REFERENCES = 20;
 const MIN_SUMMARY_CHARS = 200;
 const EMPTY_CELL = "—";
 
@@ -951,6 +956,28 @@ function dependencySection(
     lines.push("No package versions changed; this was a target-framework-only upgrade.");
   }
 
+  const added = addedPackages(dependencies);
+  if (added.length) {
+    lines.push(
+      "",
+      "#### New package references",
+      "",
+      "References the base branch did not have. Finalize opens no PR unless the recorded decision quotes the restore or build error that made the package necessary.",
+      "",
+    );
+    for (const change of added.slice(0, MAX_ADDED_REFERENCES)) {
+      const key = change.package.trim().toLowerCase();
+      const decision = decisions.find((d) => d.package.trim().toLowerCase() === key);
+      const evidence = decision?.evidence ? mdText(decision.evidence, token) : "_No evidence recorded._";
+      lines.push(
+        `- ${mdCode(change.package, token) || EMPTY_CELL} at ${versionCell(change.to, token)} in ${mdCode(change.file, token) || EMPTY_CELL} — required by: ${evidence}`,
+      );
+    }
+    if (added.length > MAX_ADDED_REFERENCES) {
+      lines.push(`- …${added.length - MAX_ADDED_REFERENCES} more new reference(s) omitted.`);
+    }
+  }
+
   const moves: string[] = [];
   for (const change of dependencies.frameworks) {
     moves.push(
@@ -1044,7 +1071,7 @@ export function prBody(result: UpgradeResult, dependencies: DependencyChanges, t
     : "No dependency versions moved; the change is confined to target frameworks and code.";
 
   const head = [
-    "## [Dotnet upgrade agent workflow.]()",
+    "## Dotnet upgrade agent workflow.",
     "",
     PR_PREAMBLE,
     "",
@@ -1059,6 +1086,8 @@ export function prBody(result: UpgradeResult, dependencies: DependencyChanges, t
     "### ` What changes have we introduced? `",
     "",
     `Target frameworks (and \`global.json\`, if present) moved to \`net10.0\`, NuGet references updated to net10.0-compatible stable versions, and the resulting build/test breaks fixed. ${tests} ${changed}`,
+    "",
+    "Scope: a package version moves here only where the `net10.0` retarget forced it. Warnings and vulnerability advisories that already applied on the base branch are left as they were — this PR adds no warning suppressions, and fixing those is a separate pull request.",
     "",
     ...dependencySection(result.packageDecisions ?? [], dependencies, token),
     "",
@@ -1128,6 +1157,36 @@ export function collectDependencyChanges(
   return capDependencyChanges(changes);
 }
 
+/** Package references the base branch did not have. Derived from the diff, like the table. */
+export function addedPackages(dependencies: DependencyChanges): PackageChange[] {
+  return dependencies.packages.filter((change) => change.kind === "added");
+}
+
+function hasAddedEvidence(decisions: PackageDecision[], pkg: string): boolean {
+  const key = pkg.trim().toLowerCase();
+  return decisions.some((d) => d.package.trim().toLowerCase() === key && (d.evidence ?? "").trim() !== "");
+}
+
+/**
+ * Added references the writer did not prove the upgrade needs. A new package belongs in the
+ * diff only when the net10.0 build cannot pass without it, so the recorded decision has to
+ * carry the restore or build error as evidence; anything else is an unexplained addition.
+ */
+export function unexplainedAdditions(
+  dependencies: DependencyChanges,
+  decisions: PackageDecision[],
+): PackageChange[] {
+  return addedPackages(dependencies).filter((change) => !hasAddedEvidence(decisions, change.package));
+}
+
+/**
+ * Warning suppressions the staged diff introduces. A warning that already fired on the base
+ * branch was not introduced by the retarget, so silencing it here is out of scope.
+ */
+export function collectSuppressions(cloneDir: string, token: string, runGit: GitRunner = git): Suppression[] {
+  return findSuppressions(runGit(["diff", "--cached", "-U0"], cloneDir, token), isArtifactPath);
+}
+
 export async function finalizeRepo(
   octokit: Octokit,
   config: AppConfig,
@@ -1194,6 +1253,18 @@ export async function finalizeRepo(
     }
 
     const dependencies = collectDependencyChanges(cloneDir, config.token, staged);
+
+    const suppressions = collectSuppressions(cloneDir, config.token);
+    if (suppressions.length) {
+      const where = suppressions.slice(0, 5).map((s) => `${s.file} (${s.token}): ${s.line}`).join("; ");
+      return fail(`refusing to open a PR that adds warning suppressions: ${where}`);
+    }
+
+    const unexplained = unexplainedAdditions(dependencies, result.packageDecisions ?? []);
+    if (unexplained.length) {
+      const where = unexplained.slice(0, 5).map((c) => `${c.package} in ${c.file}`).join(", ");
+      return fail(`refusing to open a PR that adds package reference(s) with no recorded evidence: ${where}`);
+    }
 
     git(["commit", "--no-verify", "-m", COMMIT_MESSAGE], cloneDir, config.token);
     git(["push", "--no-verify", "--", manifest.cloneUrl, `${branch}:${branch}`], cloneDir, config.token, true);

@@ -279,6 +279,47 @@ describe("prBody", () => {
     assert.ok(!body.includes(token));
   });
 
+  it("states the upgrade scope so an unforced bump reads as out of place", () => {
+    const body = prBody(sampleResult(), changedPackage, token);
+    assert.ok(body.includes("a package version moves here only where the `net10.0` retarget forced it"));
+    assert.ok(body.includes("this PR adds no warning suppressions"));
+  });
+
+  it("lists a new package reference separately with its recorded evidence", () => {
+    const body = prBody(
+      sampleResult({
+        packageDecisions: [
+          {
+            package: "System.Text.Json",
+            to: "10.0.0",
+            reason: "net10.0 dropped the transitive reference",
+            evidence: "round-1-build.log: error CS0246",
+          },
+        ],
+      }),
+      sampleDependencies({
+        packages: [{ file: "src/App.csproj", package: "System.Text.Json", to: "10.0.0", kind: "added" }],
+      }),
+      token,
+    );
+    assert.ok(body.includes("#### New package references"));
+    assert.ok(
+      body.includes("- `System.Text.Json` at `10.0.0` in `src/App.csproj` — required by: round-1-build.log: error CS0246"),
+    );
+  });
+
+  it("marks a new reference with no recorded evidence rather than implying one", () => {
+    const body = prBody(
+      sampleResult(),
+      sampleDependencies({
+        packages: [{ file: "src/App.csproj", package: "Brand.New.Pkg", to: "1.0.0", kind: "added" }],
+      }),
+      token,
+    );
+    assert.ok(body.includes("#### New package references"));
+    assert.ok(body.includes("required by: _No evidence recorded._"));
+  });
+
   it("includes the Hackney template section markers", () => {
     const body = prBody(sampleResult(), changedPackage, token);
     for (const marker of [
@@ -323,18 +364,26 @@ function mockPulls(opts: {
   return state;
 }
 
-function csprojFixture(tfm: string, newtonsoft: string): string {
+function csprojFixture(
+  tfm: string,
+  newtonsoft: string,
+  opts: { noWarn?: boolean; added?: string } = {},
+): string {
+  const properties = [`<TargetFramework>${tfm}</TargetFramework>`];
+  if (opts.noWarn) properties.push("<NoWarn>$(NoWarn);CS1591</NoWarn>");
+  const packages = [`<PackageReference Include="Newtonsoft.Json" Version="${newtonsoft}" />`];
+  if (opts.added) packages.push(`<PackageReference Include="${opts.added}" Version="1.0.0" />`);
   return [
     '<Project Sdk="Microsoft.NET.Sdk">',
-    `  <PropertyGroup><TargetFramework>${tfm}</TargetFramework></PropertyGroup>`,
-    `  <ItemGroup><PackageReference Include="Newtonsoft.Json" Version="${newtonsoft}" /></ItemGroup>`,
+    `  <PropertyGroup>${properties.join("")}</PropertyGroup>`,
+    `  <ItemGroup>${packages.join("")}</ItemGroup>`,
     "</Project>",
     "",
   ].join("\n");
 }
 
 function setupRun(opts: {
-  change?: "source" | "cursor" | "none";
+  change?: "source" | "cursor" | "none" | "suppress" | "added";
   phase?: "prepared" | "loop-complete";
   result?: ReturnType<typeof sampleResult>;
 }): {
@@ -363,6 +412,13 @@ function setupRun(opts: {
   if (opts.change === "cursor") {
     fs.mkdirSync(path.join(cloneDir, ".cursor"), { recursive: true });
     fs.writeFileSync(path.join(cloneDir, ".cursor", "rules.md"), "planted\n");
+  } else if (opts.change === "suppress") {
+    fs.writeFileSync(path.join(cloneDir, "App.csproj"), csprojFixture("net10.0", "13.0.3", { noWarn: true }));
+  } else if (opts.change === "added") {
+    fs.writeFileSync(
+      path.join(cloneDir, "App.csproj"),
+      csprojFixture("net10.0", "13.0.3", { added: "Brand.New.Pkg" }),
+    );
   } else if (opts.change !== "none") {
     fs.writeFileSync(path.join(cloneDir, "App.csproj"), csprojFixture("net10.0", "13.0.3"));
   }
@@ -478,6 +534,56 @@ describe("finalizeRepo", () => {
     assert.equal(pulls.created, 0);
     assert.equal(rawGit(["status", "--porcelain"], ctx.cloneDir).trim().length > 0, true);
     assert.equal(readManifest(dir).phase, "loop-complete");
+  });
+
+  it("refuses a staged warning suppression", async () => {
+    const ctx = setupRun({ change: "suppress" });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /adds warning suppressions/);
+    assert.match(outcome.reason ?? "", /App\.csproj \(NoWarn\)/);
+    assert.equal(pulls.created, 0);
+    assert.equal(git(["log", "-1", "--format=%s"], ctx.cloneDir, token).trim(), "init");
+  });
+
+  it("refuses an added package reference with no recorded evidence", async () => {
+    const ctx = setupRun({
+      change: "added",
+      result: sampleResult({
+        packageDecisions: [{ package: "Brand.New.Pkg", to: "1.0.0", reason: "seemed useful" }],
+      }),
+    });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, false);
+    assert.match(outcome.reason ?? "", /adds package reference\(s\) with no recorded evidence/);
+    assert.match(outcome.reason ?? "", /Brand\.New\.Pkg in App\.csproj/);
+    assert.equal(pulls.created, 0);
+    assert.equal(git(["log", "-1", "--format=%s"], ctx.cloneDir, token).trim(), "init");
+  });
+
+  it("opens the PR when an added reference carries evidence, and lists it", async () => {
+    const ctx = setupRun({
+      change: "added",
+      result: sampleResult({
+        packageDecisions: [
+          {
+            package: "Brand.New.Pkg",
+            to: "1.0.0",
+            reason: "net10.0 moved this type out of the framework",
+            evidence: "round-1-build.log: error CS0246: the type or namespace could not be found",
+          },
+        ],
+      }),
+    });
+    const pulls = mockPulls({});
+    const outcome = await finalizeRepo(pulls.octokit, ctx.config, ctx.runId);
+    assert.equal(outcome.ok, true);
+    assert.equal(pulls.created, 1);
+    const body = (pulls.createArgs[0] as { body?: string }).body ?? "";
+    assert.ok(body.includes("#### New package references"));
+    assert.ok(body.includes("- `Brand.New.Pkg` at `1.0.0` in `App.csproj` — required by: round-1-build.log"));
   });
 
   it("refuses a clone whose .git is not a directory", async () => {

@@ -43,7 +43,15 @@ it belongs where it was put and whether it will be maintainable.
 ## What to check
 
 - **Scope creep** — features, refactors, reformatting, or dependency churn unrelated
-  to moving TFMs, packages, SDK pins, and Docker/base images to .NET 10.
+  to moving TFMs, packages, SDK pins, and Docker/base images to .NET 10. The three forms
+  that keep reaching reviewing engineers as noise:
+  - a package version moved for a reason other than the retarget (a newer version exists,
+    or the old one carries a vulnerability advisory) — that upgrade is its own pull request;
+  - a **new** package reference the base branch did not have, especially one nothing in
+    this repository needs;
+  - a **new warning or audit suppression** (`NoWarn`, `#pragma warning disable`,
+    `WarningsNotAsErrors`, `TreatWarningsAsErrors`, `NuGetAudit*`) standing in for a fix,
+    where the warning was already firing before this change.
 - **Wrong layering of upgrade-only changes** — business-logic rewrites framed as
   "needed for net10.0"; API redesigns; new projects/layers that only exist to host
   a TFM bump.

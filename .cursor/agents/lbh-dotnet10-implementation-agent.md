@@ -71,6 +71,18 @@ When the original request is the .NET 10 playbook (or equivalent):
 - Update NuGet package references to **stable** versions compatible with `net10.0`,
   including `Directory.Packages.props` / Central Package Management, `packages.lock.json`
   / `package.lock.json`, and other lock files the repo already uses.
+- Move a package version **only where the retarget forces it**: restore or build fails on
+  the version you found, no `net10.0`-compatible version of it exists, or another forced
+  move requires it transitively. A newer version merely existing, or a vulnerability
+  advisory against the version you found, is **not** a reason to move it — that upgrade
+  belongs in its own pull request, and reviewing engineers read an unforced bump as noise.
+- **Do not add a package reference the repository did not already have.** If the `net10.0`
+  build cannot pass without one, add it only with the exact restore or build error that
+  requires it, quoted in that package's `package_decisions` evidence and in your summary.
+- **Do not suppress warnings or audit findings** to get a clean build: no new `NoWarn`,
+  no `#pragma warning disable`, no `WarningsNotAsErrors`, no `TreatWarningsAsErrors` flip,
+  no `NuGetAudit` / `NuGetAuditMode` / `NuGetAuditLevel` change. A warning that already
+  existed on the base branch was not introduced here; leave it and record it instead.
 - Record the rationale for every package version you move in `package_decisions`
   (see Required output). Reviewing engineers read that against the diff, so it must
   cover both halves: why the old version could not stay, and why you picked that
@@ -111,6 +123,10 @@ so leftover build servers do not hold files.
   never write files via shell redirection or heredocs.
 - No drive-by refactors, renames, reformatting, dead-code removal, or dependency
   bumps outside the scope of the request (upgrade-required package bumps are in scope).
+- Pre-existing warnings and vulnerability advisories the retarget does not force you to
+  act on go in `known_limitations`, never into the diff. The finalize helper refuses to
+  open a pull request that stages a new warning suppression, or that adds a package
+  reference with no `evidence` recorded for it.
 - Keep comments rare and purposeful.
 - Never claim something works when you have not run it. Report the command and
   its actual result. Never report a test as passing that you did not see pass.
@@ -175,13 +191,19 @@ Each entry:
   to: <version after your change; omit only if you removed the reference>
   reason: <why the old version could not stay, and why you chose this specific new
     version — stable (no preview/rc), compatible with net10.0, the lowest viable bump>
-  evidence: <optional — what you checked, e.g. "first stable release targeting net10.0",
-    or the build error the old version produced>
+  evidence: <what you checked, e.g. "first stable release targeting net10.0", or the
+    build error the old version produced; required for a new reference, see below>
 ```
 
 Bumps forced transitively (a package you had to move only because another package or the
 `net10.0` retarget required it) still need an entry saying so. If you left a package on a
 version you are unsure about, say that in `known_limitations` rather than inventing a reason.
+
+An entry with no `from` is a **new** reference, and `evidence` is mandatory on it: quote the
+exact restore or build error that cannot be resolved without that package, and name the log
+under `RUN_DIR` it came from. Finalize refuses the pull request when the diff adds a package
+reference that carries no such evidence, so an addition you cannot prove is required must be
+reverted rather than reported.
 
 When you were given review findings, also report:
 
